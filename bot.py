@@ -8,13 +8,14 @@ import os
 #  CONFIG  –  modifie ces valeurs
 # ─────────────────────────────────────────────
 TOKEN = os.environ.get("TOKEN")         # token lu depuis les variables Railway
-TRIGGER_CHANNEL_ID = 1490398403819995176  # ID du salon vocal déclencheur
+TRIGGER_CHANNEL_ID = 123456789012345678  # ID du salon vocal déclencheur
 
 # Noms des channels créés dans chaque catégorie dynamique
 TEXT_CHANNELS  = ["𝗟𝗲-𝗯𝗮𝘇𝗮𝗿", "𝗟𝗮𝗻𝗰𝗲́𝗲-𝗱𝗲-𝗱𝗲́𝘀", "𝗣𝗮𝗿𝘁𝗮𝗴𝗲-𝗿𝗲𝘀𝘀𝗼𝘂𝗿𝗰𝗲𝘀"]
 VOICE_CHANNELS = ["𝗩𝗼𝗰𝗮𝗹", "𝗣𝗿𝗶𝘃𝗲𝗿 𝗠𝗝"]
 
 INACTIVITY_MINUTES = 1   # délai avant suppression (en minutes)
+REFERENCE_CATEGORY_ID = 1455416092141813864  # nouvelle catégorie créée juste au-dessus de celle-ci
 # ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -104,10 +105,14 @@ async def on_voice_state_update(member: discord.Member,
     # ── 1. Quelqu'un rejoint le salon déclencheur ──────────────
     if after.channel and after.channel.id == TRIGGER_CHANNEL_ID:
         guild = member.guild
-        category_name = f"🎮 Session de {member.display_name}"
+        category_name = f"Session de {member.display_name}"
 
-        # Crée la catégorie
-        category = await guild.create_category(category_name)
+        # Récupère la position de la catégorie de référence
+        ref_category = guild.get_channel(REFERENCE_CATEGORY_ID)
+        position = ref_category.position if ref_category else 0
+
+        # Crée la catégorie juste au-dessus de la catégorie de référence
+        category = await guild.create_category(category_name, position=position)
         active_members[category.id] = set()
 
         # Crée les 3 salons texte
