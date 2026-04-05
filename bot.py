@@ -8,7 +8,7 @@ import os
 #  CONFIG  –  modifie ces valeurs
 # ─────────────────────────────────────────────
 TOKEN = os.environ.get("TOKEN")         # token lu depuis les variables Railway
-TRIGGER_CHANNEL_ID = 1490043360839471205  # ID du salon vocal déclencheur
+TRIGGER_CHANNEL_ID = 1490398403819995176  # ID du salon vocal déclencheur
 
 # Noms des channels créés dans chaque catégorie dynamique
 TEXT_CHANNELS  = ["📋・infos", "💬・general", "🎮・commandes"]
