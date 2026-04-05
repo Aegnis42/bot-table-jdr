@@ -105,7 +105,7 @@ async def on_voice_state_update(member: discord.Member,
     # ── 1. Quelqu'un rejoint le salon déclencheur ──────────────
     if after.channel and after.channel.id == TRIGGER_CHANNEL_ID:
         guild = member.guild
-        category_name = f"🎮 Session de {member.display_name}"
+        category_name = f"Session de {member.display_name}"
 
         # Récupère la position de la catégorie de référence
         ref_category = guild.get_channel(REFERENCE_CATEGORY_ID)
