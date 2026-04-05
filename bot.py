@@ -147,7 +147,7 @@ async def on_voice_state_update(member: discord.Member,
     # ── 1. Rejoint le salon déclencheur ───────────────────────
     if after.channel and after.channel.id == TRIGGER_CHANNEL_ID:
         guild = member.guild
-        cat_name = f"Session de {member.display_name}"
+        cat_name = f"🎮 Session de {member.display_name}"
 
         ref_cat  = guild.get_channel(REFERENCE_CATEGORY_ID)
         position = ref_cat.position if ref_cat else 0
@@ -213,14 +213,18 @@ async def on_voice_state_update(member: discord.Member,
 #  Démarrage
 # ──────────────────────────────────────────────────────────
 
+GUILD = discord.Object(id=1455403810888617996)
+
 @bot.event
 async def on_ready():
-    await tree.sync()
+    tree.copy_global_to(guild=GUILD)
+    await tree.sync(guild=GUILD)   # sync instantané sur le serveur
     check_inactivity.start()
     print(f"[BOT] Connecté en tant que {bot.user} ✅")
-    print(f"[BOT] Commandes slash synchronisées ✅")
+    print(f"[BOT] Commandes slash synchronisées instantanément ✅")
     print(f"[BOT] Membres chargés : {sum(g.member_count for g in bot.guilds)}")
 
 
 bot.run(TOKEN)
+
 
