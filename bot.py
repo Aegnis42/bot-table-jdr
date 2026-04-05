@@ -11,10 +11,10 @@ TOKEN = os.environ.get("TOKEN")         # token lu depuis les variables Railway
 TRIGGER_CHANNEL_ID = 1490398403819995176  # ID du salon vocal déclencheur
 
 # Noms des channels créés dans chaque catégorie dynamique
-TEXT_CHANNELS  = ["📋・infos", "💬・general", "🎮・commandes"]
-VOICE_CHANNELS = ["🔊 Vocal 1", "🔊 Vocal 2"]
+TEXT_CHANNELS  = ["𝗟𝗲-𝗯𝗮𝘇𝗮𝗿", "𝗟𝗮𝗻𝗰𝗲́𝗲-𝗱𝗲-𝗱𝗲́𝘀", "𝗣𝗮𝗿𝘁𝗮𝗴𝗲-𝗿𝗲𝘀𝘀𝗼𝘂𝗿𝗰𝗲𝘀"]
+VOICE_CHANNELS = ["𝗩𝗼𝗰𝗮𝗹", "𝗣𝗿𝗶𝘃𝗲𝗿 𝗠𝗝"]
 
-INACTIVITY_MINUTES = 60   # délai avant suppression (en minutes)
+INACTIVITY_MINUTES = 1   # délai avant suppression (en minutes)
 # ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
