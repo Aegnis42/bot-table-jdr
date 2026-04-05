@@ -105,21 +105,38 @@ async def on_voice_state_update(member: discord.Member,
     # ── 1. Quelqu'un rejoint le salon déclencheur ──────────────
     if after.channel and after.channel.id == TRIGGER_CHANNEL_ID:
         guild = member.guild
-        category_name = f"Session de {member.display_name}"
+        category_name = f"🎮 Session de {member.display_name}"
 
         # Récupère la position de la catégorie de référence
         ref_category = guild.get_channel(REFERENCE_CATEGORY_ID)
         position = ref_category.position if ref_category else 0
 
+        # Récupère le rôle "Nouveau" (invisible pour ce rôle)
+        nouveau_role = discord.utils.get(guild.roles, name="Nouveau")
+
+        # Permissions de la catégorie :
+        # - @everyone : visible, mais mentions @everyone désactivées
+        # - Nouveau   : invisible
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True,
+                mention_everyone=False,
+            ),
+        }
+        if nouveau_role:
+            overwrites[nouveau_role] = discord.PermissionOverwrite(view_channel=False)
+        else:
+            print("[BOT] ⚠️ Rôle 'Nouveau' introuvable — vérifier le nom exact du rôle")
+
         # Crée la catégorie juste au-dessus de la catégorie de référence
-        category = await guild.create_category(category_name, position=position)
+        category = await guild.create_category(category_name, position=position, overwrites=overwrites)
         active_members[category.id] = set()
 
-        # Crée les 3 salons texte
+        # Crée les 3 salons texte (héritent des permissions de la catégorie)
         for name in TEXT_CHANNELS:
             await guild.create_text_channel(name, category=category)
 
-        # Crée les 2 salons vocaux
+        # Crée les 2 salons vocaux (héritent des permissions de la catégorie)
         voice_list = []
         for name in VOICE_CHANNELS:
             vc = await guild.create_voice_channel(name, category=category)
