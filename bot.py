@@ -4,9 +4,7 @@ from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import os
 
-# ─────────────────────────────────────────────
-#  CONFIG  –  modifie ces valeurs
-# ─────────────────────────────────────────────
+# CONFIG
 TOKEN = os.environ.get("TOKEN")         # token lu depuis les variables Railway
 TRIGGER_CHANNEL_ID = 1490398403819995176  # ID du salon vocal déclencheur
 SPECTATE_CHANNEL_ID   = 1489613853594484866 # salon où les tables en cours s'affichent
@@ -422,21 +420,48 @@ async def on_voice_state_update(member: discord.Member,
     if after.channel and after.channel.category:
         cat = after.channel.category
         if is_dynamic_category(cat):
+            # Ignore si c'est juste le bot qui applique un mute (before et after = meme salon)
+            just_mute_change = (
+                before.channel and before.channel.id == after.channel.id
+                and before.mute != after.mute
+            )
+            if just_mute_change:
+                return
+
             active_members[cat.id].add(member.id)
             inactive_since.pop(cat.id, None)
-            # Auto server-mute si spectateur
-            if member.id in category_spectators.get(cat.id, set()):
+
+            # Auto server-mute si spectateur ET c'est sa premiere entree dans un vocal
+            # (before.channel is None = il n'etait dans aucun vocal avant)
+            is_spectator = member.id in category_spectators.get(cat.id, set())
+            first_join = before.channel is None
+            if is_spectator and first_join:
                 try:
                     await member.edit(mute=True)
                 except Exception:
                     pass
+
             await update_spectate_message(member.guild, cat)
 
     # 3. Quitte un vocal d'une session dynamique
     if before.channel and before.channel.category:
         cat = before.channel.category
         if is_dynamic_category(cat):
+            # Ignore si c'est juste un changement de mute/deafen sans changer de salon
+            if after.channel and after.channel.id == before.channel.id:
+                return
+
             active_members[cat.id].discard(member.id)
+
+            # Si c'etait un spectateur mute par le bot, on le demute en partant
+            is_spectator = member.id in category_spectators.get(cat.id, set())
+            was_muted = before.mute
+            if is_spectator and was_muted:
+                try:
+                    await member.edit(mute=False)
+                except Exception:
+                    pass
+
             if count_members_in_category(cat) == 0:
                 await delete_spectate_message(member.guild, cat.id)
                 inactive_since[cat.id] = datetime.utcnow()
