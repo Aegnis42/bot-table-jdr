@@ -231,6 +231,31 @@ class SpectateApprovalView(discord.ui.View):
         pending_spectators.pop((self.cat.id, self.spectator.id), None)
 
 
+
+# ─────────────────────────────────────────────────────────
+#  Bouton supprimer la categorie
+# ─────────────────────────────────────────────────────────
+
+class DeleteCategoryView(discord.ui.View):
+    def __init__(self, cat: discord.CategoryChannel, creator: discord.Member):
+        super().__init__(timeout=None)  # Pas de timeout, le bouton reste actif
+        self.cat     = cat
+        self.creator = creator
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.creator.id:
+            await interaction.response.send_message(
+                "Seul le createur de la session peut supprimer la categorie.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Supprimer la session", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Session en cours de suppression...", ephemeral=True)
+        await delete_spectate_message(interaction.guild, self.cat.id)
+        await delete_category(self.cat)
+
 # ─────────────────────────────────────────────────────────
 #  Reaction spectate
 # ─────────────────────────────────────────────────────────
@@ -408,11 +433,13 @@ async def on_voice_state_update(member: discord.Member,
             print(f"[BOT] Deplacement impossible : {e}")
 
         if text_channels:
+            view = DeleteCategoryView(cat, member)
             await text_channels[0].send(
                 f"Session creee par {member.mention} !\n"
                 f"La categorie est privee.\n"
                 f"Inviter quelqu'un : `/join @Pseudo`\n"
-                f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>"
+                f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>",
+                view=view
             )
 
         await post_spectate_message(guild, cat)
