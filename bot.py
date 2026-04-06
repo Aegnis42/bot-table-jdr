@@ -89,20 +89,11 @@ async def grant_access(cat: discord.CategoryChannel, member: discord.Member, spe
             await ch.set_permissions(member, overwrite=ow_view)
 
 async def set_mute_in_category(cat: discord.CategoryChannel, member: discord.Member, muted: bool):
-    """Active ou desactive le mute d'un membre dans tous les vocaux de la categorie."""
-    for ch in voice_channels_of(cat):
-        ow = ch.overwrites_for(member)
-        ow.speak  = not muted
-        ow.stream = not muted
-        await ch.set_permissions(member, overwrite=ow)
-    # Si la personne est actuellement dans un vocal, applique le server mute
-    for ch in voice_channels_of(cat):
-        if member in ch.members:
-            try:
-                await member.edit(mute=muted)
-            except Exception:
-                pass
-            break
+    """Server-mute comme clic droit -> Rendre muet sur le serveur."""
+    try:
+        await member.edit(mute=muted)
+    except Exception as e:
+        print(f"[BOT] Erreur server mute {member}: {e}")
 
 async def delete_category(cat: discord.CategoryChannel):
     print(f"[BOT] Suppression de {cat.name}")
@@ -350,46 +341,6 @@ async def join_command(
     await update_spectate_message(interaction.guild, cat)
 
 
-# ─────────────────────────────────────────────────────────
-#  Commande /mute
-# ─────────────────────────────────────────────────────────
-
-@tree.command(name="mute", description="Mute ou demute un membre de ta session")
-@app_commands.describe(
-    membre="Le membre a muter ou demuter",
-    action="mute ou unmute"
-)
-@app_commands.choices(action=[
-    app_commands.Choice(name="Muter", value="mute"),
-    app_commands.Choice(name="Demuter", value="unmute"),
-])
-async def mute_command(
-    interaction: discord.Interaction,
-    membre: discord.Member,
-    action: str,
-):
-    channel = interaction.channel
-    if not channel.category or not is_dynamic_category(channel.category):
-        await interaction.response.send_message("Commande uniquement disponible dans une session.", ephemeral=True)
-        return
-
-    cat = channel.category
-    if interaction.user.id != category_creators.get(cat.id):
-        await interaction.response.send_message("Seul le createur peut muter des membres.", ephemeral=True)
-        return
-
-    # Le createur ne peut pas se muter lui-meme
-    if membre.id == interaction.user.id:
-        await interaction.response.send_message("Tu ne peux pas te muter toi-meme.", ephemeral=True)
-        return
-
-    muted = (action == "mute")
-    await set_mute_in_category(cat, membre, muted)
-
-    if muted:
-        await interaction.response.send_message(f"**{membre.display_name}** a ete mis en sourdine.")
-    else:
-        await interaction.response.send_message(f"**{membre.display_name}** peut de nouveau parler.")
 
 
 # ─────────────────────────────────────────────────────────
@@ -424,9 +375,26 @@ async def on_voice_state_update(member: discord.Member,
             tc = await guild.create_text_channel(name, category=cat)
             text_channels.append(tc)
 
+        # Permissions createur sur les vocaux : peut muter et mettre en sourdine
+        creator_vc_ow = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            mute_members=True,
+            deafen_members=True,
+        )
+
         voice_list = []
         for name in VOICE_CHANNELS:
-            vc = await guild.create_voice_channel(name, category=cat)
+            vc = await guild.create_voice_channel(
+                name,
+                category=cat,
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    member: creator_vc_ow,
+                }
+            )
             voice_list.append(vc)
 
         if text_channels:
@@ -442,7 +410,7 @@ async def on_voice_state_update(member: discord.Member,
             await text_channels[0].send(
                 f"Session creee par {member.mention} !\n"
                 f"La categorie est privee.\n"
-                f"Inviter : `/join @Pseudo` | Muter quelqu'un : `/mute @Pseudo`\n"
+                f"Inviter quelqu'un : `/join @Pseudo`\n"
                 f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>"
             )
 
@@ -456,6 +424,12 @@ async def on_voice_state_update(member: discord.Member,
         if is_dynamic_category(cat):
             active_members[cat.id].add(member.id)
             inactive_since.pop(cat.id, None)
+            # Auto server-mute si spectateur
+            if member.id in category_spectators.get(cat.id, set()):
+                try:
+                    await member.edit(mute=True)
+                except Exception:
+                    pass
             await update_spectate_message(member.guild, cat)
 
     # 3. Quitte un vocal d'une session dynamique
