@@ -30,13 +30,13 @@ tree = bot.tree
 GUILD = discord.Object(id=GUILD_ID)
 
 # Donnees en memoire
-inactive_since:      dict[int, datetime]      = {}  # {cat_id: datetime}
-active_members:      dict[int, set[int]]      = {}  # {cat_id: set(member_id)} — en vocal
-category_creators:   dict[int, int]           = {}  # {cat_id: member_id}
-spectate_messages:   dict[int, int]           = {}  # {message_id: cat_id}
-category_texts:      dict[int, int]           = {}  # {cat_id: first_text_channel_id}
-category_spectators: dict[int, set[int]]      = {}  # {cat_id: set(spectator_id)}
-pending_spectators:  dict[tuple[int,int], int] = {} # {(cat_id, member_id): msg_id}
+inactive_since:      dict[int, datetime]       = {}
+active_members:      dict[int, set[int]]       = {}
+category_creators:   dict[int, int]            = {}
+spectate_messages:   dict[int, int]            = {}
+category_texts:      dict[int, int]            = {}
+category_spectators: dict[int, set[int]]       = {}
+pending_spectators:  dict[tuple[int,int], int] = {}
 
 
 # ─────────────────────────────────────────────────────────
@@ -58,14 +58,54 @@ def get_voice_members(cat: discord.CategoryChannel) -> list[discord.Member]:
         members.extend(vc.members)
     return members
 
-async def grant_access(cat: discord.CategoryChannel, member: discord.Member):
-    ow = discord.PermissionOverwrite(view_channel=True)
-    await cat.set_permissions(member, overwrite=ow)
+async def grant_access(cat: discord.CategoryChannel, member: discord.Member, spectator: bool = False):
+    """Donne l'acces a la categorie.
+    Si spectator=True : peut voir mais ne peut pas parler dans les vocaux.
+    """
+    # Acces en lecture a la categorie et aux salons texte
+    ow_view = discord.PermissionOverwrite(view_channel=True)
+    await cat.set_permissions(member, overwrite=ow_view)
+
     for ch in cat.channels:
+        if isinstance(ch, discord.VoiceChannel):
+            if spectator:
+                # Spectateur : peut rejoindre et ecouter, mais ne peut pas parler
+                ow_voice = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=True,
+                    speak=False,
+                    stream=False,
+                )
+            else:
+                # Membre normal : tous les droits
+                ow_voice = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=True,
+                    speak=True,
+                    stream=True,
+                )
+            await ch.set_permissions(member, overwrite=ow_voice)
+        else:
+            await ch.set_permissions(member, overwrite=ow_view)
+
+async def set_mute_in_category(cat: discord.CategoryChannel, member: discord.Member, muted: bool):
+    """Active ou desactive le mute d'un membre dans tous les vocaux de la categorie."""
+    for ch in voice_channels_of(cat):
+        ow = ch.overwrites_for(member)
+        ow.speak  = not muted
+        ow.stream = not muted
         await ch.set_permissions(member, overwrite=ow)
+    # Si la personne est actuellement dans un vocal, applique le server mute
+    for ch in voice_channels_of(cat):
+        if member in ch.members:
+            try:
+                await member.edit(mute=muted)
+            except Exception:
+                pass
+            break
 
 async def delete_category(cat: discord.CategoryChannel):
-    print(f"[BOT] Suppression de la categorie {cat.name}")
+    print(f"[BOT] Suppression de {cat.name}")
     for channel in cat.channels:
         try:    await channel.delete()
         except: pass
@@ -79,23 +119,21 @@ async def delete_category(cat: discord.CategoryChannel):
 
 
 # ─────────────────────────────────────────────────────────
-#  Gestion du message spectate
+#  Message spectate
 # ─────────────────────────────────────────────────────────
 
 def build_spectate_embed(guild: discord.Guild, cat: discord.CategoryChannel) -> discord.Embed:
     creator_id = category_creators.get(cat.id)
     creator    = guild.get_member(creator_id) if creator_id else None
 
-    # Membres en vocal
     voice_members = get_voice_members(cat)
     voice_list    = "\n".join(f"• {m.display_name}" for m in voice_members) or "*Personne*"
 
-    # Spectateurs (acces accorde mais pas en vocal)
     voice_ids    = {m.id for m in voice_members}
     spec_ids     = category_spectators.get(cat.id, set())
     spec_members = [guild.get_member(uid) for uid in spec_ids if uid not in voice_ids]
     spec_members = [m for m in spec_members if m]
-    spec_list    = "\n".join(f"• {m.display_name}" for m in spec_members) or "*Personne*"
+    spec_list    = "\n".join(f"• {m.display_name} (muet)" for m in spec_members) or "*Personne*"
 
     embed = discord.Embed(
         title=f"Session de {creator.display_name if creator else 'Inconnu'}",
@@ -115,7 +153,6 @@ async def post_spectate_message(guild: discord.Guild, cat: discord.CategoryChann
     msg   = await channel.send(embed=embed)
     await msg.add_reaction("👁️")
     spectate_messages[msg.id] = cat.id
-    print(f"[BOT] Message spectate poste pour {cat.name}")
 
 async def update_spectate_message(guild: discord.Guild, cat: discord.CategoryChannel):
     channel = guild.get_channel(SPECTATE_CHANNEL_ID)
@@ -128,7 +165,7 @@ async def update_spectate_message(guild: discord.Guild, cat: discord.CategoryCha
                 embed = build_spectate_embed(guild, cat)
                 await msg.edit(embed=embed)
             except Exception as e:
-                print(f"[BOT] Erreur update message spectate: {e}")
+                print(f"[BOT] Erreur update spectate: {e}")
             return
 
 async def delete_spectate_message(guild: discord.Guild, cat_id: int):
@@ -158,31 +195,30 @@ class SpectateApprovalView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.creator.id:
-            await interaction.response.send_message(
-                "Seul le createur peut repondre.", ephemeral=True
-            )
+            await interaction.response.send_message("Seul le createur peut repondre.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await grant_access(self.cat, self.spectator)
-        # Enregistre le spectateur
+        # Acces en mode spectateur (muet par defaut)
+        await grant_access(self.cat, self.spectator, spectator=True)
+
         if self.cat.id not in category_spectators:
             category_spectators[self.cat.id] = set()
         category_spectators[self.cat.id].add(self.spectator.id)
         pending_spectators.pop((self.cat.id, self.spectator.id), None)
 
         await interaction.response.edit_message(
-            content=f"**{self.spectator.display_name}** peut maintenant voir la session !",
+            content=f"**{self.spectator.display_name}** peut maintenant regarder la session (en sourdine).",
             view=None
         )
-        # Met a jour le message spectate
         await update_spectate_message(interaction.guild, self.cat)
 
         try:
             await self.spectator.send(
-                f"Ta demande de spectate pour **{self.cat.name}** a ete acceptee !"
+                f"Ta demande de spectate pour **{self.cat.name}** a ete acceptee !\n"
+                f"Note : tu es muet par defaut dans les vocaux."
             )
         except Exception:
             pass
@@ -195,9 +231,7 @@ class SpectateApprovalView(discord.ui.View):
             view=None
         )
         try:
-            await self.spectator.send(
-                f"Ta demande de spectate pour **{self.cat.name}** a ete refusee."
-            )
+            await self.spectator.send(f"Ta demande de spectate pour **{self.cat.name}** a ete refusee.")
         except Exception:
             pass
 
@@ -229,7 +263,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not spectator or not cat:
         return
 
-    # Retire la reaction
     try:
         channel = guild.get_channel(SPECTATE_CHANNEL_ID)
         msg = await channel.fetch_message(payload.message_id)
@@ -237,7 +270,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     except Exception:
         pass
 
-    # Demande deja en cours ?
     if (cat_id, spectator.id) in pending_spectators:
         return
 
@@ -285,7 +317,7 @@ async def check_inactivity():
 
 @tree.command(name="join", description="Invite des membres a rejoindre ta session")
 @app_commands.describe(
-    membre1="1er membre a inviter",
+    membre1="1er membre",
     membre2="2eme membre (optionnel)",
     membre3="3eme membre (optionnel)",
     membre4="4eme membre (optionnel)",
@@ -301,30 +333,63 @@ async def join_command(
 ):
     channel = interaction.channel
     if not channel.category or not is_dynamic_category(channel.category):
-        await interaction.response.send_message(
-            "Cette commande ne fonctionne que dans une session active.", ephemeral=True
-        )
+        await interaction.response.send_message("Commande uniquement disponible dans une session.", ephemeral=True)
         return
 
     cat = channel.category
     if interaction.user.id != category_creators.get(cat.id):
-        await interaction.response.send_message(
-            "Seul le createur de cette session peut inviter des membres.", ephemeral=True
-        )
+        await interaction.response.send_message("Seul le createur peut inviter.", ephemeral=True)
         return
 
     membres = [m for m in [membre1, membre2, membre3, membre4, membre5] if m is not None]
     for m in membres:
-        await grant_access(cat, m)
-        if cat.id not in category_spectators:
-            category_spectators[cat.id] = set()
-        category_spectators[cat.id].add(m.id)
+        await grant_access(cat, m, spectator=False)
+        category_spectators.setdefault(cat.id, set()).add(m.id)
 
-    await interaction.response.send_message(
-        f"Acces accorde a : {' '.join(m.mention for m in membres)}"
-    )
-    # Met a jour le message spectate
+    await interaction.response.send_message(f"Acces accorde a : {' '.join(m.mention for m in membres)}")
     await update_spectate_message(interaction.guild, cat)
+
+
+# ─────────────────────────────────────────────────────────
+#  Commande /mute
+# ─────────────────────────────────────────────────────────
+
+@tree.command(name="mute", description="Mute ou demute un membre de ta session")
+@app_commands.describe(
+    membre="Le membre a muter ou demuter",
+    action="mute ou unmute"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Muter", value="mute"),
+    app_commands.Choice(name="Demuter", value="unmute"),
+])
+async def mute_command(
+    interaction: discord.Interaction,
+    membre: discord.Member,
+    action: str,
+):
+    channel = interaction.channel
+    if not channel.category or not is_dynamic_category(channel.category):
+        await interaction.response.send_message("Commande uniquement disponible dans une session.", ephemeral=True)
+        return
+
+    cat = channel.category
+    if interaction.user.id != category_creators.get(cat.id):
+        await interaction.response.send_message("Seul le createur peut muter des membres.", ephemeral=True)
+        return
+
+    # Le createur ne peut pas se muter lui-meme
+    if membre.id == interaction.user.id:
+        await interaction.response.send_message("Tu ne peux pas te muter toi-meme.", ephemeral=True)
+        return
+
+    muted = (action == "mute")
+    await set_mute_in_category(cat, membre, muted)
+
+    if muted:
+        await interaction.response.send_message(f"**{membre.display_name}** a ete mis en sourdine.")
+    else:
+        await interaction.response.send_message(f"**{membre.display_name}** peut de nouveau parler.")
 
 
 # ─────────────────────────────────────────────────────────
@@ -346,7 +411,7 @@ async def on_voice_state_update(member: discord.Member,
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member:             discord.PermissionOverwrite(view_channel=True),
+            member:             discord.PermissionOverwrite(view_channel=True, speak=True, stream=True),
         }
 
         cat = await guild.create_category(cat_name, position=position, overwrites=overwrites)
@@ -377,7 +442,7 @@ async def on_voice_state_update(member: discord.Member,
             await text_channels[0].send(
                 f"Session creee par {member.mention} !\n"
                 f"La categorie est privee.\n"
-                f"Pour inviter directement : `/join @Pseudo`\n"
+                f"Inviter : `/join @Pseudo` | Muter quelqu'un : `/mute @Pseudo`\n"
                 f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>"
             )
 
@@ -399,11 +464,9 @@ async def on_voice_state_update(member: discord.Member,
         if is_dynamic_category(cat):
             active_members[cat.id].discard(member.id)
             if count_members_in_category(cat) == 0:
-                # Supprime le message spectate immediatement
                 await delete_spectate_message(member.guild, cat.id)
-                # Demarre le timer d'inactivite
                 inactive_since[cat.id] = datetime.utcnow()
-                print(f"[BOT] {cat.name} vide — message supprime, timer {INACTIVITY_MINUTES} min demarre")
+                print(f"[BOT] {cat.name} vide — timer {INACTIVITY_MINUTES} min demarre")
             else:
                 await update_spectate_message(member.guild, cat)
 
