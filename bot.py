@@ -115,14 +115,17 @@ def build_spectate_embed(guild: discord.Guild, cat: discord.CategoryChannel) -> 
     creator_id = category_creators.get(cat.id)
     creator    = guild.get_member(creator_id) if creator_id else None
 
-    voice_members = get_voice_members(cat)
+    spec_ids      = category_spectators.get(cat.id, set())
+
+    # En vocal : membres dans les vocaux SAUF spectateurs
+    all_voice     = get_voice_members(cat)
+    voice_members = [m for m in all_voice if m.id not in spec_ids]
     voice_list    = "\n".join(f"• {m.display_name}" for m in voice_members) or "*Personne*"
 
-    voice_ids    = {m.id for m in voice_members}
-    spec_ids     = category_spectators.get(cat.id, set())
-    spec_members = [guild.get_member(uid) for uid in spec_ids if uid not in voice_ids]
-    spec_members = [m for m in spec_members if m]
-    spec_list    = "\n".join(f"• {m.display_name} (muet)" for m in spec_members) or "*Personne*"
+    # Spectateurs : toujours dans leur colonne, qu'ils soient en vocal ou non
+    spec_members  = [guild.get_member(uid) for uid in spec_ids]
+    spec_members  = [m for m in spec_members if m]
+    spec_list     = "\n".join(f"• {m.display_name}" for m in spec_members) or "*Personne*"
 
     embed = discord.Embed(
         title=f"Session de {creator.display_name if creator else 'Inconnu'}",
@@ -431,11 +434,13 @@ async def on_voice_state_update(member: discord.Member,
             active_members[cat.id].add(member.id)
             inactive_since.pop(cat.id, None)
 
-            # Auto server-mute si spectateur ET c'est sa premiere entree dans un vocal
-            # (before.channel is None = il n'etait dans aucun vocal avant)
+            # Auto server-mute si spectateur ET il vient de null ou d'un salon hors categorie
             is_spectator = member.id in category_spectators.get(cat.id, set())
-            first_join = before.channel is None
-            if is_spectator and first_join:
+            coming_from_outside = (
+                before.channel is None or
+                before.channel.category_id != cat.id
+            )
+            if is_spectator and coming_from_outside:
                 try:
                     await member.edit(mute=True)
                 except Exception:
