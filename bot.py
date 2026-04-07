@@ -5,16 +5,40 @@ from datetime import datetime, timedelta
 import os
 
 # CONFIG
-TOKEN = os.environ.get("TOKEN")         # token lu depuis les variables Railway
-TRIGGER_CHANNEL_ID = 1490398403819995176  # ID du salon vocal déclencheur
-SPECTATE_CHANNEL_ID   = 1489613853594484866 # salon où les tables en cours s'affichent
+TOKEN = os.environ.get("TOKEN")
+TRIGGER_CHANNEL_ID    = 123456789012345678
+SPECTATE_CHANNEL_ID   = 1489613853594484866
 # Noms des channels créés dans chaque catégorie dynamique
 TEXT_CHANNELS  = ["𝗟𝗲-𝗯𝗮𝘇𝗮𝗿", "𝗟𝗮𝗻𝗰𝗲́𝗲-𝗱𝗲-𝗱𝗲́𝘀", "𝗣𝗮𝗿𝘁𝗮𝗴𝗲-𝗿𝗲𝘀𝘀𝗼𝘂𝗿𝗰𝗲𝘀"]
 VOICE_CHANNELS = ["𝗩𝗼𝗰𝗮𝗹", "𝗣𝗿𝗶𝘃𝗲𝗿 𝗠𝗝"]
 
 INACTIVITY_MINUTES    = 60
 REFERENCE_CATEGORY_ID = 1455416092141813864
-GUILD_ID              = 1455403810888617996  # nouvelle catégorie créée juste au-dessus de celle-ci
+GUILD_ID              = 1455403810888617996
+
+# Forums a surveiller
+FORUM_OS_ID         = 1455406081621758027
+FORUM_CAMPAGNE_ID   = 1455406457829851148
+ANNONCE_CHANNEL_ID  = 1491158533058855115
+
+# Correspondance tag -> nom du role a pinger
+TAG_TO_ROLE = {
+    "Semaine / Journee": "Semaine / Journée",
+    "Semaine / Journée": "Semaine / Journée",
+    "Semaine / Soir":    "Semaine / Soir",
+    "Weekend / Journee": "Weekend / Journée",
+    "Weekend / Journée": "Weekend / Journée",
+    "Weekend / Soir":    "Weekend / Soir",
+    "Novice":            "Novice",
+    "D&D5":              "D&D5e",
+    "D&D5e":             "D&D5e",
+    "Cthullu":           "Cthulhu",
+    "Cthulhu":           "Cthulhu",
+    "WoD":               "WoD",
+    "Cyberpunk":         "Cyberpunk",
+    "Homebrew":          "Homebrew",
+    "Autres":            "Autres",
+}
 
 intents = discord.Intents.default()
 intents.voice_states    = True
@@ -22,6 +46,7 @@ intents.guilds          = True
 intents.members         = True
 intents.reactions       = True
 intents.message_content = True
+intents.guild_messages   = True
 
 bot  = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -501,6 +526,81 @@ async def on_voice_state_update(member: discord.Member,
             else:
                 await update_spectate_message(member.guild, cat)
 
+
+
+
+# ─────────────────────────────────────────────────────────
+#  Surveillance des forums
+# ─────────────────────────────────────────────────────────
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    """Detecte un nouveau post dans les forums surveilles."""
+    parent_id = thread.parent_id
+    if parent_id not in (FORUM_OS_ID, FORUM_CAMPAGNE_ID):
+        return
+
+    guild = thread.guild
+    annonce_channel = guild.get_channel(ANNONCE_CHANNEL_ID)
+    if not annonce_channel:
+        return
+
+    # Type de partie
+    is_os = (parent_id == FORUM_OS_ID)
+    type_label = "One-Shot" if is_os else "Campagne"
+    type_emoji = "⚔️" if is_os else "📜"
+
+    # Attend un court instant pour que les tags soient charges
+    await discord.utils.sleep_until(
+        datetime.utcnow().replace(microsecond=0).__class__.utcnow()
+    )
+    # Recupere le thread avec ses tags
+    try:
+        thread = await guild.fetch_channel(thread.id)
+    except Exception:
+        pass
+
+    # Recupere les roles a pinger depuis les tags du post
+    applied_tags = getattr(thread, 'applied_tags', [])
+    roles_to_ping = []
+    for tag in applied_tags:
+        role_name = TAG_TO_ROLE.get(tag.name)
+        if role_name:
+            role = discord.utils.get(guild.roles, name=role_name)
+            if role:
+                roles_to_ping.append(role)
+
+    ping_str = " ".join(r.mention for r in roles_to_ping) if roles_to_ping else ""
+
+    # Auteur du post
+    author = thread.owner
+    if not author:
+        try:
+            author = await guild.fetch_member(thread.owner_id)
+        except Exception:
+            author = None
+
+    embed = discord.Embed(
+        title=f"{type_emoji} Nouveau post : {thread.name}",
+        description=(
+            f"**Type :** {type_label}
+"
+            f"**Auteur :** {author.mention if author else 'Inconnu'}
+"
+            f"**Voir le post :** {thread.mention}"
+        ),
+        color=discord.Color.blue() if is_os else discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    if applied_tags:
+        embed.add_field(
+            name="Tags",
+            value=" • ".join(t.name for t in applied_tags),
+            inline=False
+        )
+
+    await annonce_channel.send(content=ping_str or None, embed=embed)
+    print(f"[BOT] Annonce forum : {thread.name} ({type_label})")
 
 # ─────────────────────────────────────────────────────────
 #  Demarrage
