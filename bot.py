@@ -580,15 +580,14 @@ async def on_thread_create(thread: discord.Thread):
         except Exception:
             author = None
 
+    desc = (
+        f"**Type :** {type_label}\n"
+        f"**Auteur :** {author.mention if author else 'Inconnu'}\n"
+        f"**Voir le post :** {thread.mention}"
+    )
     embed = discord.Embed(
         title=f"{type_emoji} Nouveau post : {thread.name}",
-        description=(
-            f"**Type :** {type_label}
-"
-            f"**Auteur :** {author.mention if author else 'Inconnu'}
-"
-            f"**Voir le post :** {thread.mention}"
-        ),
+        description=desc,
         color=discord.Color.blue() if is_os else discord.Color.gold(),
         timestamp=datetime.utcnow()
     )
