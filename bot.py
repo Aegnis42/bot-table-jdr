@@ -58,7 +58,9 @@ active_members:      dict[int, set[int]]       = {}
 category_creators:   dict[int, int]            = {}
 spectate_messages:   dict[int, int]            = {}
 category_texts:      dict[int, int]            = {}
-category_spectators: dict[int, set[int]]       = {}
+category_spectators: dict[int, set[int]]       = {}  # ceux qui spectate (demande via reaction)
+category_players:    dict[int, set[int]]       = {}  # joueurs invites via /join
+category_mj_chan:    dict[int, int]             = {}  # {cat_id: mj_channel_id}
 pending_spectators:  dict[tuple[int,int], int] = {}
 
 
@@ -130,6 +132,8 @@ async def delete_category(cat: discord.CategoryChannel):
     category_creators.pop(cat.id, None)
     category_texts.pop(cat.id, None)
     category_spectators.pop(cat.id, None)
+    category_players.pop(cat.id, None)
+    category_mj_chan.pop(cat.id, None)
 
 
 # ─────────────────────────────────────────────────────────
@@ -137,28 +141,33 @@ async def delete_category(cat: discord.CategoryChannel):
 # ─────────────────────────────────────────────────────────
 
 def build_spectate_embed(guild: discord.Guild, cat: discord.CategoryChannel) -> discord.Embed:
-    creator_id = category_creators.get(cat.id)
-    creator    = guild.get_member(creator_id) if creator_id else None
+    creator_id  = category_creators.get(cat.id)
+    creator     = guild.get_member(creator_id) if creator_id else None
 
-    spec_ids      = category_spectators.get(cat.id, set())
+    player_ids  = category_players.get(cat.id, set())
+    spec_ids    = category_spectators.get(cat.id, set())
 
-    # En vocal : membres dans les vocaux SAUF spectateurs
-    all_voice     = get_voice_members(cat)
-    voice_members = [m for m in all_voice if m.id not in spec_ids]
-    voice_list    = "\n".join(f"• {m.display_name}" for m in voice_members) or "*Personne*"
+    # MJ (createur)
+    mj_str      = creator.display_name if creator else "*Inconnu*"
 
-    # Spectateurs : toujours dans leur colonne, qu'ils soient en vocal ou non
-    spec_members  = [guild.get_member(uid) for uid in spec_ids]
-    spec_members  = [m for m in spec_members if m]
-    spec_list     = "\n".join(f"• {m.display_name}" for m in spec_members) or "*Personne*"
+    # Joueurs (/join) — exclu le createur
+    player_members = [guild.get_member(uid) for uid in player_ids if uid != creator_id]
+    player_members = [m for m in player_members if m]
+    player_str  = "\n".join(f"• {m.display_name}" for m in player_members) or "*Personne*"
+
+    # Spectateurs (demande via reaction)
+    spec_members = [guild.get_member(uid) for uid in spec_ids]
+    spec_members = [m for m in spec_members if m]
+    spec_str    = "\n".join(f"• {m.display_name}" for m in spec_members) or "*Personne*"
 
     embed = discord.Embed(
-        title=f"Session de {creator.display_name if creator else 'Inconnu'}",
+        title=f"Session de {mj_str}",
         color=discord.Color.green(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="En vocal", value=voice_list, inline=True)
-    embed.add_field(name="Spectateurs", value=spec_list, inline=True)
+    embed.add_field(name="MJ", value=mj_str, inline=False)
+    embed.add_field(name="Joueurs", value=player_str, inline=True)
+    embed.add_field(name="Spectateurs", value=spec_str, inline=True)
     embed.set_footer(text="Reagis avec l'oeil pour demander a regarder")
     return embed
 
@@ -320,13 +329,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not creator:
         return
 
-    first_text_id = category_texts.get(cat_id)
-    first_text    = guild.get_channel(first_text_id) if first_text_id else None
-    if not first_text:
+    mj_chan_id = category_mj_chan.get(cat_id)
+    mj_chan    = guild.get_channel(mj_chan_id) if mj_chan_id else None
+    if not mj_chan:
         return
 
     view = SpectateApprovalView(cat, spectator, creator)
-    approval_msg = await first_text.send(
+    approval_msg = await mj_chan.send(
         f"{creator.mention} — **{spectator.display_name}** demande a regarder ta session !",
         view=view
     )
@@ -386,7 +395,7 @@ async def join_command(
     membres = [m for m in [membre1, membre2, membre3, membre4, membre5] if m is not None]
     for m in membres:
         await grant_access(cat, m, spectator=False)
-        category_spectators.setdefault(cat.id, set()).add(m.id)
+        category_players.setdefault(cat.id, set()).add(m.id)  # joueur, pas spectateur
 
     await interaction.response.send_message(f"Acces accorde a : {' '.join(m.mention for m in membres)}")
     await update_spectate_message(interaction.guild, cat)
@@ -420,11 +429,20 @@ async def on_voice_state_update(member: discord.Member,
         active_members[cat.id]      = set()
         category_creators[cat.id]   = member.id
         category_spectators[cat.id] = set()
+        category_players[cat.id]    = set()
 
         text_channels = []
         for name in TEXT_CHANNELS:
             tc = await guild.create_text_channel(name, category=cat)
             text_channels.append(tc)
+
+        # Salon prive MJ : visible uniquement par le createur
+        mj_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member:             discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        mj_channel = await guild.create_text_channel("mj-prive", category=cat, overwrites=mj_overwrites)
+        category_mj_chan[cat.id] = mj_channel.id
 
         # Permissions createur sur les vocaux : peut muter et mettre en sourdine
         creator_vc_ow = discord.PermissionOverwrite(
@@ -457,15 +475,15 @@ async def on_voice_state_update(member: discord.Member,
         except Exception as e:
             print(f"[BOT] Deplacement impossible : {e}")
 
-        if text_channels:
-            view = DeleteCategoryView(cat, member)
-            await text_channels[0].send(
-                f"Session creee par {member.mention} !\n"
-                f"La categorie est privee.\n"
-                f"Inviter quelqu'un : `/join @Pseudo`\n"
-                f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>",
-                view=view
-            )
+        # Message bot dans le salon MJ prive
+        view = DeleteCategoryView(cat, member)
+        await mj_channel.send(
+            f"Bienvenue {member.mention} !\n"
+            f"**Commandes disponibles :**\n"
+            f"Inviter un joueur : `/join @Pseudo`\n"
+            f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>",
+            view=view
+        )
 
         await post_spectate_message(guild, cat)
         print(f"[BOT] Categorie {cat_name} creee pour {member.display_name}")
@@ -616,3 +634,4 @@ async def on_ready():
 
 
 bot.run(TOKEN)
+
