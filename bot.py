@@ -588,7 +588,7 @@ async def on_thread_create(thread: discord.Thread):
             if role:
                 roles_to_ping.append(role)
 
-    ping_str = " ".join(r.mention for r in roles_to_ping) if roles_to_ping else ""
+    ping_str = "@Joueur ".join(r.mention for r in roles_to_ping) if roles_to_ping else ""
 
     # Auteur du post
     author = thread.owner
