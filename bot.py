@@ -619,7 +619,11 @@ async def on_thread_create(thread: discord.Thread):
             inline=False
         )
 
-    await annonce_channel.send(content=ping_str or None, embed=embed)
+    # Ajoute le ping @Joueur en plus des pings de tags
+    joueur_role = discord.utils.get(guild.roles, name="Joueur")
+    joueur_ping = joueur_role.mention if joueur_role else ""
+    full_ping   = f"{joueur_ping} {ping_str}".strip() if ping_str else joueur_ping
+    await annonce_channel.send(content=full_ping or None, embed=embed)
     print(f"[BOT] Annonce forum : {thread.name} ({type_label})")
 
 # ─────────────────────────────────────────────────────────
