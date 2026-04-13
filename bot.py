@@ -176,7 +176,10 @@ async def post_spectate_message(guild: discord.Guild, cat: discord.CategoryChann
     if not channel:
         return
     embed = build_spectate_embed(guild, cat)
-    msg   = await channel.send(embed=embed)
+    # Ping le role Joueur
+    joueur_role = discord.utils.get(guild.roles, name="Joueur")
+    ping = joueur_role.mention if joueur_role else ""
+    msg = await channel.send(content=ping or None, embed=embed)
     await msg.add_reaction("👁️")
     spectate_messages[msg.id] = cat.id
 
@@ -588,7 +591,7 @@ async def on_thread_create(thread: discord.Thread):
             if role:
                 roles_to_ping.append(role)
 
-    ping_str = "@Joueur ".join(r.mention for r in roles_to_ping) if roles_to_ping else ""
+    ping_str = " ".join(r.mention for r in roles_to_ping) if roles_to_ping else ""
 
     # Auteur du post
     author = thread.owner
@@ -634,4 +637,3 @@ async def on_ready():
 
 
 bot.run(TOKEN)
-
