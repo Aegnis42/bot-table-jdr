@@ -176,10 +176,7 @@ async def post_spectate_message(guild: discord.Guild, cat: discord.CategoryChann
     if not channel:
         return
     embed = build_spectate_embed(guild, cat)
-    # Ping le role Joueur
-    joueur_role = discord.utils.get(guild.roles, name="Joueur")
-    ping = joueur_role.mention if joueur_role else ""
-    msg = await channel.send(content=ping or None, embed=embed)
+    msg = await channel.send(embed=embed)
     await msg.add_reaction("👁️")
     spectate_messages[msg.id] = cat.id
 
