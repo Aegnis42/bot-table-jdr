@@ -133,6 +133,7 @@ async def set_mute_in_category(cat: discord.CategoryChannel, member: discord.Mem
 
 async def delete_category(cat: discord.CategoryChannel):
     print(f"[BOT] Suppression de {cat.name}")
+    await delete_spectate_message(cat.guild, cat.id)
     for channel in cat.channels:
         try:    await channel.delete()
         except: pass
@@ -298,7 +299,6 @@ class DeleteCategoryView(discord.ui.View):
     @discord.ui.button(label="Supprimer la session", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Session en cours de suppression...", ephemeral=True)
-        await delete_spectate_message(interaction.guild, self.cat.id)
         await delete_category(self.cat)
 
 # ─────────────────────────────────────────────────────────
@@ -549,7 +549,6 @@ async def on_voice_state_update(member: discord.Member,
                     pass
 
             if count_members_in_category(cat) == 0:
-                await delete_spectate_message(member.guild, cat.id)
                 inactive_since[cat.id] = datetime.utcnow()
                 print(f"[BOT] {cat.name} vide — timer {INACTIVITY_MINUTES} min demarre")
             else:
