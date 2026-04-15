@@ -872,12 +872,7 @@ async def check_sessions():
                         await grant_access(cat, player, spectator=False)
                         category_players[cat.id].add(uid)
 
-                # Deplace le MJ dans le vocal
-                try:
-                    await mj.move_to(voice_list[0])
-                    active_members[cat.id].add(mj.id)
-                except Exception:
-                    pass
+                # Pas de deplacement automatique : le MJ rejoint de lui-meme
 
                 # Message dans mj-prive
                 view = DeleteCategoryView(cat, mj)
