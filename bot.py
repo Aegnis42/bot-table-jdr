@@ -1055,4 +1055,22 @@ async def on_ready():
     print(f"[BOT] Membres charges : {sum(g.member_count for g in bot.guilds)}")
 
 
-bot.run(TOKEN)
+import time
+
+MAX_RETRIES = 5
+retry_delay = 30  # secondes
+
+for attempt in range(1, MAX_RETRIES + 1):
+    try:
+        bot.run(TOKEN)
+        break  # sortie propre
+    except discord.errors.HTTPException as e:
+        if e.status == 429:
+            print(f"[BOT] Rate limited par Discord (tentative {attempt}/{MAX_RETRIES}). Attente {retry_delay}s...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 600)  # backoff exponentiel, max 10 min
+        else:
+            raise
+    except Exception as e:
+        print(f"[BOT] Erreur inattendue : {e}")
+        raise
