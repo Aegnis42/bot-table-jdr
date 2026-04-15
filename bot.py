@@ -16,6 +16,10 @@ INACTIVITY_MINUTES    = 60
 REFERENCE_CATEGORY_ID = 1455416092141813864
 GUILD_ID              = 1455403810888617996
 
+# Calendrier
+CALENDAR_CHANNEL_ID = 1493991218470850681
+SESSIONS_FILE       = "/app/sessions.json"
+
 # Forums a surveiller
 FORUM_OS_ID         = 1455406081621758027
 FORUM_CAMPAGNE_ID   = 1455406457829851148
@@ -623,6 +627,410 @@ async def on_thread_create(thread: discord.Thread):
     await annonce_channel.send(content=full_ping or None, embed=embed)
     print(f"[BOT] Annonce forum : {thread.name} ({type_label})")
 
+
+# ─────────────────────────────────────────────────────────
+#  Systeme de calendrier JDR
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class Session:
+    id:          str
+    mj_id:       int
+    game:        str
+    starts_at:   str          # ISO format UTC
+    player_ids:  list[int]    = field(default_factory=list)
+    created:     bool         = False
+    cancelled:   bool         = False
+    cal_msg_id:  Optional[int] = None  # ID du message dans le salon calendrier
+
+
+def sessions_load() -> list[Session]:
+    try:
+        with open(SESSIONS_FILE, "r") as f:
+            data = json.load(f)
+        return [Session(**s) for s in data]
+    except Exception:
+        return []
+
+def sessions_save(sessions: list[Session]):
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump([asdict(s) for s in sessions], f, indent=2)
+
+def sessions_upcoming(sessions: list[Session]) -> list[Session]:
+    now = datetime.utcnow()
+    return sorted(
+        [s for s in sessions if not s.cancelled and not s.created
+         and datetime.fromisoformat(s.starts_at) > now],
+        key=lambda s: s.starts_at
+    )
+
+
+def build_session_embed(guild: discord.Guild, session: Session) -> discord.Embed:
+    mj      = guild.get_member(session.mj_id)
+    players = [guild.get_member(uid) for uid in session.player_ids]
+    players = [m for m in players if m]
+
+    dt = datetime.fromisoformat(session.starts_at)
+    # Discord timestamp for local time display
+    ts = int(dt.timestamp())
+
+    embed = discord.Embed(
+        title=f"🎲 {session.game}",
+        color=discord.Color.purple(),
+        timestamp=dt
+    )
+    embed.add_field(name="MJ",      value=mj.mention if mj else "Inconnu",         inline=True)
+    embed.add_field(name="Date",    value=f"<t:{ts}:F>",                            inline=True)
+    embed.add_field(name="Dans",    value=f"<t:{ts}:R>",                            inline=True)
+    if players:
+        embed.add_field(
+            name="Joueurs",
+            value="\n".join(f"• {m.display_name}" for m in players),
+            inline=False
+        )
+    embed.set_footer(text=f"ID session : {session.id[:8]}")
+    return embed
+
+
+JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+
+def get_week_bounds() -> tuple[datetime, datetime]:
+    """Retourne le debut (lundi 00:00 UTC) et la fin (dimanche 23:59 UTC) de la semaine courante."""
+    now     = datetime.utcnow()
+    monday  = now - timedelta(days=now.weekday(), hours=now.hour, minutes=now.minute, seconds=now.second, microseconds=now.microsecond)
+    sunday  = monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    return monday, sunday
+
+
+def build_calendar_embed(guild: discord.Guild, sessions: list[Session]) -> discord.Embed:
+    monday, sunday = get_week_bounds()
+
+    # Sessions de la semaine (non annulees)
+    week_sessions = [
+        s for s in sessions
+        if not s.cancelled
+        and monday <= datetime.fromisoformat(s.starts_at) <= sunday
+    ]
+    week_sessions.sort(key=lambda s: s.starts_at)
+
+    ts_monday = int(monday.timestamp())
+    ts_sunday = int(sunday.timestamp())
+
+    embed = discord.Embed(
+        title="📅 Agenda de la semaine",
+        description=f"<t:{ts_monday}:D> — <t:{ts_sunday}:D>",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow()
+    )
+
+    # Groupe par jour
+    days: dict[int, list[Session]] = {i: [] for i in range(7)}  # 0=lundi
+    for s in week_sessions:
+        dt      = datetime.fromisoformat(s.starts_at)
+        weekday = dt.weekday()
+        days[weekday].append(s)
+
+    has_any = False
+    for day_idx in range(7):
+        day_sessions = days[day_idx]
+        if not day_sessions:
+            continue
+        has_any = True
+        lines = []
+        for s in day_sessions:
+            mj      = guild.get_member(s.mj_id)
+            dt      = datetime.fromisoformat(s.starts_at)
+            ts      = int(dt.timestamp())
+            players = [guild.get_member(uid) for uid in s.player_ids]
+            players = [m for m in players if m]
+            player_str = ", ".join(m.display_name for m in players) or "Aucun"
+            status  = "✅" if s.created else "🕐"
+            lines.append(
+                f"{status} **{s.game}** — <t:{ts}:t>\n"
+                f"MJ : {mj.display_name if mj else '?'}  |  Joueurs : {player_str}\n"
+                f"`ID : {s.id[:8]}`"
+            )
+        embed.add_field(
+            name=f"📆 {JOURS_FR[day_idx]}",
+            value="\n\n".join(lines),
+            inline=False
+        )
+
+    if not has_any:
+        embed.add_field(name="Cette semaine", value="*Aucune partie planifiee.*", inline=False)
+
+    embed.set_footer(text="Mis a jour")
+    return embed
+
+
+async def refresh_calendar(guild: discord.Guild, sessions: list[Session]):
+    """Met a jour le message epingle de l agenda hebdomadaire."""
+    channel = guild.get_channel(CALENDAR_CHANNEL_ID)
+    if not channel:
+        return
+    embed = build_calendar_embed(guild, sessions)
+    # Cherche un message existant du bot a editer
+    async for msg in channel.history(limit=20):
+        if msg.author == bot.user and msg.embeds:
+            try:
+                await msg.edit(embed=embed)
+                return
+            except Exception:
+                pass
+    # Aucun message : en cree un nouveau et l epingle
+    msg = await channel.send(embed=embed)
+    try:
+        await msg.pin()
+    except Exception:
+        pass
+
+
+# Tache : rafraichit l'agenda toutes les heures
+@tasks.loop(hours=1)
+async def refresh_weekly_calendar():
+    sessions = sessions_load()
+    for guild in bot.guilds:
+        await refresh_calendar(guild, sessions)
+    print("[BOT] Agenda rafraichi")
+
+
+# Tache : cree les tables 10 min avant la partie
+@tasks.loop(minutes=1)
+async def check_sessions():
+    sessions = sessions_load()
+    now      = datetime.utcnow()
+    modified = False
+
+    for session in sessions:
+        if session.cancelled or session.created:
+            continue
+        starts = datetime.fromisoformat(session.starts_at)
+        delta  = (starts - now).total_seconds()
+
+        if 0 <= delta <= 600:  # dans les 10 prochaines minutes
+            session.created = True
+            modified = True
+
+            for guild in bot.guilds:
+                mj = guild.get_member(session.mj_id)
+                if not mj:
+                    continue
+
+                ref_cat  = guild.get_channel(REFERENCE_CATEGORY_ID)
+                position = ref_cat.position if ref_cat else 0
+                cat_name = f"Session de {mj.display_name}"
+
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    mj:                 discord.PermissionOverwrite(view_channel=True, speak=True, stream=True),
+                }
+
+                cat = await guild.create_category(cat_name, position=position, overwrites=overwrites)
+                active_members[cat.id]      = set()
+                category_creators[cat.id]   = mj.id
+                category_spectators[cat.id] = set()
+                category_players[cat.id]    = set()
+
+                text_channels = []
+                for name in TEXT_CHANNELS:
+                    tc = await guild.create_text_channel(name, category=cat)
+                    text_channels.append(tc)
+
+                mj_overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    mj:                 discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                }
+                mj_channel = await guild.create_text_channel("mj-prive", category=cat, overwrites=mj_overwrites)
+                category_mj_chan[cat.id]  = mj_channel.id
+                category_texts[cat.id]   = text_channels[0].id if text_channels else None
+
+                creator_vc_ow = discord.PermissionOverwrite(
+                    view_channel=True, connect=True, speak=True,
+                    stream=True, mute_members=True, deafen_members=True,
+                )
+                voice_list = []
+                for name in VOICE_CHANNELS:
+                    vc = await guild.create_voice_channel(
+                        name, category=cat,
+                        overwrites={
+                            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                            mj: creator_vc_ow,
+                        }
+                    )
+                    voice_list.append(vc)
+
+                # Invite les joueurs
+                for uid in session.player_ids:
+                    player = guild.get_member(uid)
+                    if player:
+                        await grant_access(cat, player, spectator=False)
+                        category_players[cat.id].add(uid)
+
+                # Deplace le MJ dans le vocal
+                try:
+                    await mj.move_to(voice_list[0])
+                    active_members[cat.id].add(mj.id)
+                except Exception:
+                    pass
+
+                # Message dans mj-prive
+                view = DeleteCategoryView(cat, mj)
+                await mj_channel.send(
+                    f"Ta session **{session.game}** commence dans moins de 10 minutes !\n"
+                    f"Inviter un joueur : `/join @Pseudo`\n"
+                    f"Les autres peuvent demander a regarder via <#{SPECTATE_CHANNEL_ID}>",
+                    view=view
+                )
+
+                await post_spectate_message(guild, cat)
+                # Met a jour le calendrier
+                await refresh_calendar(guild, sessions)
+                print(f"[BOT] Table auto-creee pour session {session.id[:8]} ({session.game})")
+
+    # Nettoyage : supprime les sessions des semaines passees, garde la semaine en cours et le futur
+    monday, _ = get_week_bounds()
+    before    = len(sessions)
+    sessions  = [
+        s for s in sessions
+        if datetime.fromisoformat(s.starts_at) >= monday
+    ]
+    if len(sessions) < before:
+        modified = True
+        print(f"[BOT] {before - len(sessions)} session(s) de semaines passees supprimee(s) du fichier")
+
+    if modified:
+        sessions_save(sessions)
+
+
+# ─────────────────────────────────────────────────────────
+#  Commandes calendrier
+# ─────────────────────────────────────────────────────────
+
+@tree.command(name="planifier", description="Planifie une session de JDR")
+@app_commands.describe(
+    jeu="Systeme de jeu (ex: D&D5e, Cthulhu...)",
+    date="Date au format JJ/MM/AAAA",
+    heure="Heure au format HH:MM (heure de Paris)",
+    joueur1="1er joueur",
+    joueur2="2eme joueur (optionnel)",
+    joueur3="3eme joueur (optionnel)",
+    joueur4="4eme joueur (optionnel)",
+    joueur5="5eme joueur (optionnel)",
+)
+async def planifier_command(
+    interaction: discord.Interaction,
+    jeu:     str,
+    date:    str,
+    heure:   str,
+    joueur1: discord.Member,
+    joueur2: discord.Member | None = None,
+    joueur3: discord.Member | None = None,
+    joueur4: discord.Member | None = None,
+    joueur5: discord.Member | None = None,
+):
+    # Parse date et heure (Europe/Paris, gere automatiquement heure ete/hiver)
+    try:
+        dt_naive  = datetime.strptime(f"{date} {heure}", "%d/%m/%Y %H:%M")
+        dt_paris  = dt_naive.replace(tzinfo=PARIS_TZ)
+        dt_utc    = dt_paris.astimezone(timezone.utc).replace(tzinfo=None)
+    except ValueError:
+        await interaction.response.send_message(
+            "Format invalide. Utilise JJ/MM/AAAA et HH:MM\nEx: `/planifier D&D5e 25/12/2025 20:00`",
+            ephemeral=True
+        )
+        return
+
+    if dt_utc < datetime.utcnow():
+        await interaction.response.send_message("Cette date est dans le passe !", ephemeral=True)
+        return
+
+    joueurs = [m for m in [joueur1, joueur2, joueur3, joueur4, joueur5] if m is not None]
+
+    session = Session(
+        id         = str(uuid.uuid4()),
+        mj_id      = interaction.user.id,
+        game       = jeu,
+        starts_at  = dt_utc.isoformat(),
+        player_ids = [m.id for m in joueurs],
+    )
+
+    sessions = sessions_load()
+    sessions.append(session)
+    sessions_save(sessions)
+
+    await refresh_calendar(interaction.guild, sessions)
+
+    ts = int(dt_utc.timestamp())
+    player_str = ", ".join(m.mention for m in joueurs) if joueurs else "Aucun"
+    await interaction.response.send_message(
+        f"✅ Session planifiee !\n"
+        f"**Jeu :** {jeu}\n"
+        f"**Date :** <t:{ts}:F>\n"
+        f"**Joueurs :** {player_str}\n"
+        f"**ID :** `{session.id[:8]}`\n"
+        f"La table sera creee automatiquement 10 min avant.",
+        ephemeral=True
+    )
+    print(f"[BOT] Session planifiee : {jeu} par {interaction.user} le {date} {heure}")
+
+
+@tree.command(name="annuler-session", description="Annule une session planifiee")
+@app_commands.describe(session_id="Les 8 premiers caracteres de l'ID de la session")
+async def annuler_session_command(interaction: discord.Interaction, session_id: str):
+    sessions = sessions_load()
+    session  = next((s for s in sessions if s.id.startswith(session_id) and s.mj_id == interaction.user.id), None)
+
+    if not session:
+        await interaction.response.send_message(
+            "Session introuvable ou tu n'en es pas le MJ.", ephemeral=True
+        )
+        return
+
+    if session.cancelled:
+        await interaction.response.send_message("Cette session est deja annulee.", ephemeral=True)
+        return
+
+    if session.created:
+        await interaction.response.send_message("Cette session a deja commence.", ephemeral=True)
+        return
+
+    session.cancelled = True
+    sessions_save(sessions)
+    await refresh_calendar(interaction.guild, sessions)
+
+    # DM tous les joueurs pour les prevenir
+    mj      = interaction.user
+    dt      = datetime.fromisoformat(session.starts_at)
+    ts      = int(dt.timestamp())
+    dm_ok   = []
+    dm_fail = []
+    for uid in session.player_ids:
+        player = interaction.guild.get_member(uid)
+        if player:
+            try:
+                await player.send(
+                    f"❌ La session **{session.game}** prevue le <t:{ts}:F> "
+                    f"a ete annulee par **{mj.display_name}**."
+                )
+                dm_ok.append(player.display_name)
+            except Exception:
+                dm_fail.append(player.display_name if player else str(uid))
+
+    recap = f"Session **{session.game}** annulee."
+    if dm_ok:
+        recap += f"\nMP envoye a : {', '.join(dm_ok)}"
+    if dm_fail:
+        recap += f"\nImpossible de contacter : {', '.join(dm_fail)} (MP fermes)"
+
+    await interaction.response.send_message(recap, ephemeral=True)
+
+
+@tree.command(name="calendrier", description="Affiche les sessions a venir")
+async def calendrier_command(interaction: discord.Interaction):
+    sessions = sessions_load()
+    embed    = build_calendar_embed(interaction.guild, sessions)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # ─────────────────────────────────────────────────────────
 #  Demarrage
 # ─────────────────────────────────────────────────────────
@@ -632,8 +1040,11 @@ async def on_ready():
     tree.copy_global_to(guild=GUILD)
     await tree.sync(guild=GUILD)
     check_inactivity.start()
+    check_sessions.start()
+    refresh_weekly_calendar.start()
     print(f"[BOT] Connecte en tant que {bot.user}")
     print(f"[BOT] Commandes slash synchronisees")
+    print(f"[BOT] Calendrier JDR actif")
     print(f"[BOT] Membres charges : {sum(g.member_count for g in bot.guilds)}")
 
 
