@@ -1,14 +1,21 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from dataclasses import dataclass, field, asdict
+from typing import Optional
 import os
+import json
+import uuid
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
 # CONFIG
 TOKEN = os.environ.get("TOKEN")
 TRIGGER_CHANNEL_ID    = 1490398403819995176
 SPECTATE_CHANNEL_ID   = 1489613853594484866
-# Noms des channels créés dans chaque catégorie dynamique
+
 TEXT_CHANNELS  = ["𝗟𝗲-𝗯𝗮𝘇𝗮𝗿", "𝗟𝗮𝗻𝗰𝗲́𝗲-𝗱𝗲-𝗱𝗲́𝘀", "𝗣𝗮𝗿𝘁𝗮𝗴𝗲-𝗿𝗲𝘀𝘀𝗼𝘂𝗿𝗰𝗲𝘀"]
 VOICE_CHANNELS = ["𝗩𝗼𝗰𝗮𝗹", "𝗣𝗿𝗶𝘃𝗲𝗿 𝗠𝗝"]
 
