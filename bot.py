@@ -9,6 +9,7 @@ import uuid
 import asyncpg
 import asyncio
 import time
+import json
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
@@ -20,6 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 TRIGGER_CHANNEL_ID    = 1490398403819995176
 SPECTATE_CHANNEL_ID   = 1489613853594484866
+STATS_CHANNEL_ID      = 1508044925407858818
 TEXT_CHANNELS         = ["𝗟𝗲-𝗯𝗮𝘇𝗮𝗿", "𝗟𝗮𝗻𝗰𝗲́𝗲-𝗱𝗲-𝗱𝗲́𝘀", "𝗣𝗮𝗿𝘁𝗮𝗴𝗲-𝗿𝗲𝘀𝘀𝗼𝘂𝗿𝗰𝗲𝘀"]
 VOICE_CHANNELS        = ["𝗩𝗼𝗰𝗮𝗹", "𝗣𝗿𝗶𝘃𝗲𝗿 𝗠𝗝"]
 INACTIVITY_MINUTES    = 60
@@ -51,13 +53,15 @@ TAG_TO_ROLE = {
 
 @dataclass
 class Session:
-    id:         str
-    mj_id:      int
-    game:       str
-    starts_at:  str
-    player_ids: list[int] = field(default_factory=list)
-    created:    bool      = False
-    cancelled:  bool      = False
+    id:           str
+    mj_id:        int
+    game:         str
+    starts_at:    str
+    player_ids:   list[int] = field(default_factory=list)
+    created:      bool      = False
+    cancelled:    bool      = False
+    reminded_24h: bool      = False
+    reminded_1h:  bool      = False
 
 
 # ─────────────────────────────────────────────────────────
@@ -120,6 +124,8 @@ async def init_db():
                 cancelled   BOOLEAN   NOT NULL DEFAULT FALSE
             )
         """)
+        await conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS reminded_24h BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS reminded_1h  BOOLEAN NOT NULL DEFAULT FALSE")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS active_categories (
                 cat_id         BIGINT    PRIMARY KEY,
@@ -142,6 +148,17 @@ async def init_db():
                 member_id BIGINT NOT NULL,
                 role      TEXT   NOT NULL,
                 PRIMARY KEY (cat_id, member_id, role)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_templates (
+                id         TEXT     PRIMARY KEY,
+                creator_id BIGINT   NOT NULL,
+                name       TEXT     NOT NULL,
+                game       TEXT     NOT NULL,
+                player_ids BIGINT[] NOT NULL DEFAULT '{}',
+                messages   JSONB    NOT NULL DEFAULT '[]',
+                UNIQUE (creator_id, name)
             )
         """)
     print("[DB] Tables initialisées")
@@ -207,26 +224,47 @@ async def db_session_insert(s: Session):
 async def db_session_update(s: Session):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE sessions SET created=$1, cancelled=$2 WHERE id=$3",
-            s.created, s.cancelled, s.id,
+            """UPDATE sessions
+               SET created=$1, cancelled=$2, reminded_24h=$3, reminded_1h=$4
+               WHERE id=$5""",
+            s.created, s.cancelled, s.reminded_24h, s.reminded_1h, s.id,
+        )
+
+async def db_session_update_full(s: Session):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE sessions
+               SET game=$1, starts_at=$2, player_ids=$3,
+                   created=$4, cancelled=$5, reminded_24h=$6, reminded_1h=$7
+               WHERE id=$8""",
+            s.game, datetime.fromisoformat(s.starts_at), s.player_ids,
+            s.created, s.cancelled, s.reminded_24h, s.reminded_1h, s.id,
         )
 
 async def db_sessions_all() -> list[Session]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM sessions")
     return [Session(
-        id         = r['id'],
-        mj_id      = r['mj_id'],
-        game       = r['game'],
-        starts_at  = r['starts_at'].isoformat(),
-        player_ids = list(r['player_ids']),
-        created    = r['created'],
-        cancelled  = r['cancelled'],
+        id           = r['id'],
+        mj_id        = r['mj_id'],
+        game         = r['game'],
+        starts_at    = r['starts_at'].isoformat(),
+        player_ids   = list(r['player_ids']),
+        created      = r['created'],
+        cancelled    = r['cancelled'],
+        reminded_24h = r['reminded_24h'],
+        reminded_1h  = r['reminded_1h'],
     ) for r in rows]
 
-async def db_sessions_delete_before(dt: datetime) -> int:
+async def db_sessions_cleanup(monday: datetime) -> int:
+    cutoff_90 = utcnow() - timedelta(days=90)
     async with db_pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM sessions WHERE starts_at < $1", dt)
+        result = await conn.execute(
+            """DELETE FROM sessions
+               WHERE (starts_at < $1 AND (cancelled = TRUE OR created = FALSE))
+                  OR (starts_at < $2 AND created = TRUE)""",
+            monday, cutoff_90,
+        )
     return int(result.split()[-1])
 
 
@@ -277,9 +315,86 @@ async def db_member_add(cat_id: int, member_id: int, role: str):
             cat_id, member_id, role,
         )
 
+async def db_member_remove(cat_id: int, member_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM category_members WHERE cat_id=$1 AND member_id=$2",
+            cat_id, member_id,
+        )
+
+
+# ─── Helpers DB stats ─────────────────────────────────────
+
+async def db_stats_fetch() -> dict:
+    async with db_pool.acquire() as conn:
+        now         = utcnow()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        total      = await conn.fetchval("SELECT COUNT(*) FROM sessions WHERE created = TRUE")
+        this_month = await conn.fetchval(
+            "SELECT COUNT(*) FROM sessions WHERE created = TRUE AND starts_at >= $1", month_start
+        )
+        top_mjs   = await conn.fetch(
+            """SELECT mj_id, COUNT(*) AS cnt FROM sessions WHERE created = TRUE
+               GROUP BY mj_id ORDER BY cnt DESC LIMIT 3"""
+        )
+        top_games = await conn.fetch(
+            """SELECT game, COUNT(*) AS cnt FROM sessions WHERE created = TRUE
+               GROUP BY game ORDER BY cnt DESC LIMIT 3"""
+        )
+    return {
+        "total":      total,
+        "this_month": this_month,
+        "top_mjs":    [(r['mj_id'], r['cnt']) for r in top_mjs],
+        "top_games":  [(r['game'],  r['cnt']) for r in top_games],
+    }
+
+
+# ─── Helpers DB templates ─────────────────────────────────
+
+async def db_template_insert(tmpl_id: str, creator_id: int, name: str,
+                              game: str, player_ids: list[int], messages: list[dict]):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO session_templates (id, creator_id, name, game, player_ids, messages)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb)""",
+            tmpl_id, creator_id, name, game, player_ids, json.dumps(messages),
+        )
+
+async def db_template_get(creator_id: int, name: str) -> dict | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM session_templates WHERE creator_id=$1 AND name=$2",
+            creator_id, name,
+        )
+    if not row:
+        return None
+    return {
+        "id":         row['id'],
+        "creator_id": row['creator_id'],
+        "name":       row['name'],
+        "game":       row['game'],
+        "player_ids": list(row['player_ids']),
+        "messages":   json.loads(row['messages']) if isinstance(row['messages'], str) else row['messages'],
+    }
+
+async def db_templates_list(creator_id: int) -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM session_templates WHERE creator_id=$1 ORDER BY name", creator_id
+        )
+    return [{
+        "id":         r['id'],
+        "creator_id": r['creator_id'],
+        "name":       r['name'],
+        "game":       r['game'],
+        "player_ids": list(r['player_ids']),
+        "messages":   json.loads(r['messages']) if isinstance(r['messages'], str) else r['messages'],
+    } for r in rows]
+
 
 # ─────────────────────────────────────────────────────────
-#  Helpers
+#  Helpers généraux
 # ─────────────────────────────────────────────────────────
 
 def is_dynamic_category(cat: discord.CategoryChannel) -> bool:
@@ -320,6 +435,8 @@ async def delete_category(cat: discord.CategoryChannel):
               category_texts, category_spectators, category_players, category_mj_chan):
         d.pop(cat.id, None)
     await db_cat_unregister(cat.id)
+    for guild in bot.guilds:
+        await refresh_stats(guild)
 
 
 async def create_session_category(
@@ -327,7 +444,6 @@ async def create_session_category(
     mj: discord.Member,
     players: list[discord.Member] | None = None,
 ) -> tuple[discord.CategoryChannel, discord.TextChannel, list[discord.VoiceChannel]]:
-    """Crée la catégorie + salons pour une session. Retourne (cat, mj_channel, voice_list)."""
     ref_cat  = guild.get_channel(REFERENCE_CATEGORY_ID)
     position = ref_cat.position if ref_cat else 0
 
@@ -408,7 +524,7 @@ def build_spectate_embed(guild: discord.Guild, cat: discord.CategoryChannel) -> 
     spec_members = [m for m in spec_members if m]
     spec_str     = "\n".join(f"• {m.display_name}" for m in spec_members) or "*Personne*"
 
-    embed = discord.Embed(title=f"Session de {mj_str}", color=discord.Color.green(), timestamp=utcnow())
+    embed = discord.Embed(title=cat.name, color=discord.Color.green(), timestamp=utcnow())
     embed.add_field(name="MJ",          value=mj_str,    inline=False)
     embed.add_field(name="Joueurs",     value=player_str, inline=True)
     embed.add_field(name="Spectateurs", value=spec_str,   inline=True)
@@ -450,6 +566,99 @@ async def delete_spectate_message(guild: discord.Guild, cat_id: int):
                 pass
             spectate_messages.pop(msg_id, None)
     await db_spectate_remove_by_cat(cat_id)
+
+
+# ─────────────────────────────────────────────────────────
+#  Stats
+# ─────────────────────────────────────────────────────────
+
+async def refresh_stats(guild: discord.Guild):
+    channel = guild.get_channel(STATS_CHANNEL_ID)
+    if not channel:
+        return
+    try:
+        stats = await db_stats_fetch()
+    except Exception as e:
+        print(f"[BOT] Erreur fetch stats: {e}")
+        return
+
+    mj_lines = []
+    for i, (mj_id, cnt) in enumerate(stats["top_mjs"], 1):
+        member = guild.get_member(mj_id)
+        name   = member.display_name if member else f"<@{mj_id}>"
+        mj_lines.append(f"{i}. {name} — {cnt} session{'s' if cnt > 1 else ''}")
+
+    game_lines = []
+    for i, (game, cnt) in enumerate(stats["top_games"], 1):
+        game_lines.append(f"{i}. {game} — {cnt} session{'s' if cnt > 1 else ''}")
+
+    embed = discord.Embed(
+        title="📊 Statistiques des sessions JDR",
+        color=discord.Color.gold(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(
+        name="Sessions jouées",
+        value=f"**{stats['total']}** all time  |  **{stats['this_month']}** ce mois-ci",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏆 Top 3 MJ",
+        value="\n".join(mj_lines) or "*Aucune donnée*",
+        inline=True,
+    )
+    embed.add_field(
+        name="🎲 Top 3 jeux",
+        value="\n".join(game_lines) or "*Aucune donnée*",
+        inline=True,
+    )
+    embed.set_footer(text="Mis à jour")
+
+    async for msg in channel.history(limit=10):
+        if msg.author == bot.user and msg.embeds:
+            try:
+                await msg.edit(embed=embed)
+                return
+            except Exception:
+                pass
+    msg = await channel.send(embed=embed)
+    try:
+        await msg.pin()
+    except Exception:
+        pass
+
+
+@tasks.loop(hours=1)
+async def refresh_stats_task():
+    for guild in bot.guilds:
+        await refresh_stats(guild)
+
+
+# ─────────────────────────────────────────────────────────
+#  Rappels automatiques
+# ─────────────────────────────────────────────────────────
+
+async def _send_session_reminders(session: Session, guild: discord.Guild, label: str):
+    ts  = int(datetime.fromisoformat(session.starts_at).timestamp())
+    if label == "24h":
+        text = f"⏰ Ta session **{session.game}** commence dans 24h — <t:{ts}:F>"
+    else:
+        text = f"🔔 Ta session **{session.game}** commence dans 1h ! — <t:{ts}:F>"
+
+    mj = guild.get_member(session.mj_id)
+    if mj:
+        try:
+            await mj.send(text)
+        except Exception:
+            pass
+
+    for uid in session.player_ids:
+        player = guild.get_member(uid)
+        if player:
+            try:
+                await player.send(text)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────
@@ -505,6 +714,89 @@ class SpectateApprovalView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────
+#  Templates — restauration
+# ─────────────────────────────────────────────────────────
+
+async def _restore_template(
+    interaction: discord.Interaction,
+    cat: discord.CategoryChannel,
+    mj: discord.Member,
+    tmpl: dict,
+):
+    guild = interaction.guild
+    await cat.edit(name=tmpl["name"])
+
+    old_player_ids = set(category_players.get(cat.id, set()))
+    new_player_ids = set(tmpl["player_ids"])
+    to_add = new_player_ids - old_player_ids
+
+    for uid in to_add:
+        member = guild.get_member(uid)
+        if member:
+            await grant_access(cat, member, spectator=False)
+            category_players[cat.id].add(uid)
+            await db_member_add(cat.id, uid, 'player')
+
+    # Poster les messages archivés dans les salons texte
+    msgs_by_channel: dict[str, list[dict]] = {}
+    for m in tmpl["messages"]:
+        msgs_by_channel.setdefault(m["channel"], []).append(m)
+
+    for ch in cat.channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        if ch.name == "mj-prive":
+            continue
+        history = msgs_by_channel.get(ch.name)
+        if not history:
+            continue
+        header = discord.Embed(
+            title=f"📜 Archives — {tmpl['name']}",
+            color=discord.Color.dark_grey(),
+        )
+        await ch.send(embed=header)
+        batch = []
+        for entry in history:
+            line = f"**[{entry['author']}]** : {entry['content']}"
+            batch.append(line)
+            if len(batch) >= 10:
+                await ch.send("\n".join(batch))
+                batch = []
+        if batch:
+            await ch.send("\n".join(batch))
+
+    await update_spectate_message(guild, cat)
+    await interaction.followup.send(f"✅ Table **{tmpl['name']}** restaurée.", ephemeral=True)
+
+
+class RestoreTemplateSelect(discord.ui.Select):
+    def __init__(self, cat: discord.CategoryChannel, mj: discord.Member, templates: list[dict]):
+        self.cat      = cat
+        self.mj       = mj
+        self.tmpl_map = {t["id"]: t for t in templates}
+        options = [
+            discord.SelectOption(
+                label=t["name"][:100],
+                description=f"{t['game']} — {len(t['player_ids'])} joueur(s)"[:100],
+                value=t["id"],
+            )
+            for t in templates[:25]
+        ]
+        super().__init__(placeholder="Choisir une table...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        tmpl = self.tmpl_map[self.values[0]]
+        await interaction.response.defer(ephemeral=True)
+        await _restore_template(interaction, self.cat, self.mj, tmpl)
+
+
+class RestoreSelectView(discord.ui.View):
+    def __init__(self, cat: discord.CategoryChannel, mj: discord.Member, templates: list[dict]):
+        super().__init__(timeout=60)
+        self.add_item(RestoreTemplateSelect(cat, mj, templates))
+
+
+# ─────────────────────────────────────────────────────────
 #  Modal + boutons contrôle de session
 # ─────────────────────────────────────────────────────────
 
@@ -524,11 +816,63 @@ class RenameSessionModal(discord.ui.Modal, title="Nommer la session"):
         new_name = self.nom.value.strip()
         try:
             await self.cat.edit(name=new_name)
+            await update_spectate_message(interaction.guild, self.cat)
             await interaction.response.send_message(
                 f"Session renommée en **{new_name}**.", ephemeral=True
             )
         except Exception as e:
             await interaction.response.send_message(f"Erreur : {e}", ephemeral=True)
+
+
+class SaveTemplateModal(discord.ui.Modal, title="Sauvegarder la table"):
+    nom = discord.ui.TextInput(
+        label="Nom du template",
+        placeholder="Ex: Donjon du Dragon Rouge",
+        max_length=50,
+        required=True,
+    )
+
+    def __init__(self, cat: discord.CategoryChannel, creator: discord.Member):
+        super().__init__()
+        self.cat     = cat
+        self.creator = creator
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        name = self.nom.value.strip()
+
+        existing = await db_template_get(self.creator.id, name)
+        if existing:
+            await interaction.followup.send(
+                f"Un template nommé **{name}** existe déjà. Choisis un autre nom.", ephemeral=True
+            )
+            return
+
+        messages: list[dict] = []
+        for ch in self.cat.channels:
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if ch.name == "mj-prive":
+                continue
+            async for m in ch.history(limit=50, oldest_first=True):
+                if m.author.bot:
+                    continue
+                if not m.content.strip():
+                    continue
+                messages.append({
+                    "channel": ch.name,
+                    "author":  m.author.display_name,
+                    "content": m.content[:500],
+                    "ts":      m.created_at.strftime("%d/%m %H:%M"),
+                })
+
+        player_ids = list(category_players.get(self.cat.id, set()))
+        game       = self.cat.name
+
+        await db_template_insert(str(uuid.uuid4()), self.creator.id, name, game, player_ids, messages)
+        await interaction.followup.send(
+            f"✅ Template **{name}** sauvegardé avec {len(messages)} message(s).", ephemeral=True
+        )
 
 
 class SessionControlView(discord.ui.View):
@@ -549,13 +893,29 @@ class SessionControlView(discord.ui.View):
     async def rename_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameSessionModal(self.cat))
 
+    @discord.ui.button(label="Sauvegarder", style=discord.ButtonStyle.secondary, emoji="💾")
+    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SaveTemplateModal(self.cat, self.creator))
+
+    @discord.ui.button(label="Charger une table", style=discord.ButtonStyle.secondary, emoji="📂")
+    async def load_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        templates = await db_templates_list(self.creator.id)
+        if not templates:
+            await interaction.response.send_message(
+                "Tu n'as aucun template sauvegardé.", ephemeral=True
+            )
+            return
+        view = RestoreSelectView(self.cat, self.creator, templates)
+        await interaction.response.send_message(
+            "Choisis une table à restaurer :", view=view, ephemeral=True
+        )
+
     @discord.ui.button(label="Supprimer la session", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Session en cours de suppression...", ephemeral=True)
         await delete_category(self.cat)
 
 
-# Alias pour ne pas casser les références existantes
 DeleteCategoryView = SessionControlView
 
 
@@ -668,6 +1028,58 @@ async def join_command(
 
     await interaction.response.send_message(f"Acces accorde a : {' '.join(m.mention for m in membres)}")
     await update_spectate_message(interaction.guild, cat)
+
+
+# ─────────────────────────────────────────────────────────
+#  Commande /kick
+# ─────────────────────────────────────────────────────────
+
+@tree.command(name="kick", description="Expulse un membre de ta session")
+@app_commands.describe(membre="Le membre à expulser")
+async def kick_command(interaction: discord.Interaction, membre: discord.Member):
+    channel = interaction.channel
+    if not channel.category or not is_dynamic_category(channel.category):
+        await interaction.response.send_message("Commande uniquement disponible dans une session.", ephemeral=True)
+        return
+
+    cat = channel.category
+    if interaction.user.id != category_creators.get(cat.id):
+        await interaction.response.send_message("Seul le créateur peut expulser.", ephemeral=True)
+        return
+
+    is_player    = membre.id in category_players.get(cat.id, set())
+    is_spectator = membre.id in category_spectators.get(cat.id, set())
+    if not is_player and not is_spectator:
+        await interaction.response.send_message("Ce membre ne fait pas partie de ta session.", ephemeral=True)
+        return
+
+    await cat.set_permissions(membre, overwrite=None)
+    for ch in cat.channels:
+        await ch.set_permissions(membre, overwrite=None)
+
+    for vc in voice_channels_of(cat):
+        if membre in vc.members:
+            try:
+                await membre.move_to(None)
+            except Exception:
+                pass
+            break
+
+    category_players.get(cat.id, set()).discard(membre.id)
+    category_spectators.get(cat.id, set()).discard(membre.id)
+    active_members.get(cat.id, set()).discard(membre.id)
+
+    await db_member_remove(cat.id, membre.id)
+    await update_spectate_message(interaction.guild, cat)
+
+    try:
+        await membre.send(f"Tu as été expulsé de la session **{cat.name}**.")
+    except Exception:
+        pass
+
+    await interaction.response.send_message(
+        f"**{membre.display_name}** a été expulsé de la session.", ephemeral=True
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -903,6 +1315,25 @@ async def check_sessions():
     sessions = await db_sessions_all()
     now      = utcnow()
 
+    # Rappels automatiques
+    for session in sessions:
+        if session.cancelled or session.created:
+            continue
+        delta = (datetime.fromisoformat(session.starts_at) - now).total_seconds()
+
+        if not session.reminded_24h and 23 * 3600 - 600 <= delta <= 25 * 3600:
+            for guild in bot.guilds:
+                await _send_session_reminders(session, guild, "24h")
+            session.reminded_24h = True
+            await db_session_update(session)
+
+        if not session.reminded_1h and 3000 <= delta <= 4200:
+            for guild in bot.guilds:
+                await _send_session_reminders(session, guild, "1h")
+            session.reminded_1h = True
+            await db_session_update(session)
+
+    # Création automatique des tables
     for session in sessions:
         if session.cancelled or session.created:
             continue
@@ -929,12 +1360,13 @@ async def check_sessions():
             )
             await post_spectate_message(guild, cat)
             await refresh_calendar(guild, sessions)
+            await refresh_stats(guild)
             print(f"[BOT] Table auto-créée pour {session.id[:8]} ({session.game})")
 
     monday, _ = get_week_bounds()
-    deleted   = await db_sessions_delete_before(monday)
+    deleted   = await db_sessions_cleanup(monday)
     if deleted:
-        print(f"[BOT] {deleted} session(s) de semaines passées supprimée(s)")
+        print(f"[BOT] {deleted} session(s) supprimée(s) par cleanup")
 
 
 # ─────────────────────────────────────────────────────────
@@ -1005,6 +1437,120 @@ async def planifier_command(
     print(f"[BOT] Session planifiée : {jeu} par {interaction.user} le {date} {heure}")
 
 
+@tree.command(name="modifier-session", description="Modifie une session planifiée")
+@app_commands.describe(
+    session_id="Les 8 premiers caractères de l'ID de la session",
+    jeu="Nouveau système de jeu (optionnel)",
+    date="Nouvelle date JJ/MM/AAAA (optionnel)",
+    heure="Nouvelle heure HH:MM Paris (optionnel)",
+    joueur1="Nouveau joueur 1 (optionnel)",
+    joueur2="Nouveau joueur 2 (optionnel)",
+    joueur3="Nouveau joueur 3 (optionnel)",
+    joueur4="Nouveau joueur 4 (optionnel)",
+    joueur5="Nouveau joueur 5 (optionnel)",
+)
+async def modifier_session_command(
+    interaction: discord.Interaction,
+    session_id: str,
+    jeu:     str | None = None,
+    date:    str | None = None,
+    heure:   str | None = None,
+    joueur1: discord.Member | None = None,
+    joueur2: discord.Member | None = None,
+    joueur3: discord.Member | None = None,
+    joueur4: discord.Member | None = None,
+    joueur5: discord.Member | None = None,
+):
+    sessions = await db_sessions_all()
+    session  = next(
+        (s for s in sessions if s.id.startswith(session_id) and s.mj_id == interaction.user.id),
+        None,
+    )
+    if not session:
+        await interaction.response.send_message("Session introuvable ou tu n'en es pas le MJ.", ephemeral=True)
+        return
+    if session.cancelled:
+        await interaction.response.send_message("Cette session est annulée.", ephemeral=True)
+        return
+    if session.created:
+        await interaction.response.send_message("Cette session a déjà commencé.", ephemeral=True)
+        return
+
+    date_changed = False
+
+    if jeu:
+        session.game = jeu
+
+    if date or heure:
+        current_dt   = datetime.fromisoformat(session.starts_at)
+        current_paris = current_dt.replace(tzinfo=timezone.utc).astimezone(PARIS_TZ)
+        date_str     = date  or current_paris.strftime("%d/%m/%Y")
+        heure_str    = heure or current_paris.strftime("%H:%M")
+        try:
+            dt_naive = datetime.strptime(f"{date_str} {heure_str}", "%d/%m/%Y %H:%M")
+            dt_paris = dt_naive.replace(tzinfo=PARIS_TZ)
+            dt_utc   = dt_paris.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError:
+            await interaction.response.send_message(
+                "Format de date/heure invalide. Utilise JJ/MM/AAAA et HH:MM", ephemeral=True
+            )
+            return
+        if dt_utc < utcnow():
+            await interaction.response.send_message("Cette date est dans le passé !", ephemeral=True)
+            return
+        session.starts_at    = dt_utc.isoformat()
+        session.reminded_24h = False
+        session.reminded_1h  = False
+        date_changed         = True
+
+    new_joueurs = [m for m in [joueur1, joueur2, joueur3, joueur4, joueur5] if m is not None]
+    if new_joueurs:
+        old_ids = set(session.player_ids)
+        new_ids = {m.id for m in new_joueurs}
+
+        removed_ids = old_ids - new_ids
+        added_ids   = new_ids - old_ids
+
+        ts = int(datetime.fromisoformat(session.starts_at).timestamp())
+        for uid in removed_ids:
+            player = interaction.guild.get_member(uid)
+            if player:
+                try:
+                    await player.send(
+                        f"Tu as été retiré de la session **{session.game}** prévue le <t:{ts}:F>."
+                    )
+                except Exception:
+                    pass
+        for uid in added_ids:
+            player = interaction.guild.get_member(uid)
+            if player:
+                try:
+                    await player.send(
+                        f"Tu as été ajouté à la session **{session.game}** prévue le <t:{ts}:F>."
+                    )
+                except Exception:
+                    pass
+
+        session.player_ids = list(new_ids)
+
+    await db_session_update_full(session)
+    sessions = await db_sessions_all()
+    await refresh_calendar(interaction.guild, sessions)
+
+    changes = []
+    if jeu:
+        changes.append(f"jeu → **{jeu}**")
+    if date_changed:
+        ts = int(datetime.fromisoformat(session.starts_at).timestamp())
+        changes.append(f"date → <t:{ts}:F>")
+    if new_joueurs:
+        changes.append("joueurs mis à jour")
+
+    await interaction.response.send_message(
+        f"✅ Session modifiée : {', '.join(changes) or 'aucun changement'}.", ephemeral=True
+    )
+
+
 @tree.command(name="annuler-session", description="Annule une session planifiee")
 @app_commands.describe(session_id="Les 8 premiers caracteres de l'ID de la session")
 async def annuler_session_command(interaction: discord.Interaction, session_id: str):
@@ -1027,6 +1573,7 @@ async def annuler_session_command(interaction: discord.Interaction, session_id: 
     await db_session_update(session)
     sessions = await db_sessions_all()
     await refresh_calendar(interaction.guild, sessions)
+    await refresh_stats(interaction.guild)
 
     dt      = datetime.fromisoformat(session.starts_at)
     ts      = int(dt.timestamp())
@@ -1074,6 +1621,10 @@ async def on_ready():
         check_sessions.start()
     if not refresh_weekly_calendar.is_running():
         refresh_weekly_calendar.start()
+    if not refresh_stats_task.is_running():
+        refresh_stats_task.start()
+    for guild in bot.guilds:
+        await refresh_stats(guild)
     print(f"[BOT] Connecté en tant que {bot.user}")
     print(f"[BOT] Membres chargés : {sum(g.member_count for g in bot.guilds)}")
 
