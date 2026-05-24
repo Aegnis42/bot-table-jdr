@@ -366,7 +366,7 @@ async def create_session_category(
         await guild.create_voice_channel(
             name, category=cat,
             overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
                 mj: creator_vc_ow,
             },
         )
@@ -505,10 +505,33 @@ class SpectateApprovalView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────
-#  Bouton supprimer la catégorie
+#  Modal + boutons contrôle de session
 # ─────────────────────────────────────────────────────────
 
-class DeleteCategoryView(discord.ui.View):
+class RenameSessionModal(discord.ui.Modal, title="Nommer la session"):
+    nom = discord.ui.TextInput(
+        label="Nom de la session",
+        placeholder="Ex: Donjon du Dragon Rouge",
+        max_length=50,
+        required=True,
+    )
+
+    def __init__(self, cat: discord.CategoryChannel):
+        super().__init__()
+        self.cat = cat
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_name = self.nom.value.strip()
+        try:
+            await self.cat.edit(name=new_name)
+            await interaction.response.send_message(
+                f"Session renommée en **{new_name}**.", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"Erreur : {e}", ephemeral=True)
+
+
+class SessionControlView(discord.ui.View):
     def __init__(self, cat: discord.CategoryChannel, creator: discord.Member):
         super().__init__(timeout=None)
         self.cat     = cat
@@ -517,15 +540,23 @@ class DeleteCategoryView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.creator.id:
             await interaction.response.send_message(
-                "Seul le createur de la session peut supprimer la categorie.", ephemeral=True
+                "Seul le créateur de la session peut faire ça.", ephemeral=True
             )
             return False
         return True
+
+    @discord.ui.button(label="Nommer la session", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def rename_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RenameSessionModal(self.cat))
 
     @discord.ui.button(label="Supprimer la session", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Session en cours de suppression...", ephemeral=True)
         await delete_category(self.cat)
+
+
+# Alias pour ne pas casser les références existantes
+DeleteCategoryView = SessionControlView
 
 
 # ─────────────────────────────────────────────────────────
