@@ -380,6 +380,17 @@ async def db_template_get(creator_id: int, name: str) -> dict | None:
         "messages":   json.loads(row['messages']) if isinstance(row['messages'], str) else row['messages'],
     }
 
+async def db_template_update(tmpl_id: str, game: str, player_ids: list[int], messages: list[dict]):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE session_templates SET game=$1, player_ids=$2, messages=$3::jsonb WHERE id=$4",
+            game, player_ids, json.dumps(messages), tmpl_id,
+        )
+
+async def db_template_delete(tmpl_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM session_templates WHERE id=$1", tmpl_id)
+
 async def db_templates_list(creator_id: int) -> list[dict]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -716,6 +727,53 @@ class SpectateApprovalView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────
+#  Templates — collecte des messages (partagée)
+# ─────────────────────────────────────────────────────────
+
+async def _collect_channel_messages(cat: discord.CategoryChannel) -> list[dict]:
+    messages = []
+    for ch in cat.channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        if ch.name == "mj-prive":
+            continue
+        async for m in ch.history(limit=50, oldest_first=True):
+            if m.author.id == bot.user.id:
+                continue
+            content     = m.content.strip()
+            attachments = []
+            for a in m.attachments[:5]:
+                if a.size > 4 * 1024 * 1024:
+                    attachments.append({"filename": a.filename, "data": None, "too_large": True})
+                else:
+                    try:
+                        raw = await a.read()
+                        attachments.append({
+                            "filename": a.filename,
+                            "data": base64.b64encode(raw).decode("ascii"),
+                        })
+                    except Exception:
+                        attachments.append({"filename": a.filename, "data": None, "too_large": False})
+            embed_parts = []
+            for e in m.embeds:
+                label = e.title or (e.description[:80] if e.description else "") or "[embed]"
+                embed_parts.append(f"[Embed : {label}]")
+            if embed_parts:
+                content = (content + "\n" + " | ".join(embed_parts)).strip()
+            if not content and not attachments:
+                continue
+            messages.append({
+                "channel":     ch.name,
+                "author":      m.author.display_name,
+                "content":     content[:500],
+                "ts":          m.created_at.strftime("%d/%m %H:%M"),
+                "is_bot":      m.author.bot,
+                "attachments": attachments[:5],
+            })
+    return messages
+
+
+# ─────────────────────────────────────────────────────────
 #  Templates — restauration
 # ─────────────────────────────────────────────────────────
 
@@ -859,52 +917,94 @@ class SaveTemplateModal(discord.ui.Modal, title="Sauvegarder la table"):
             )
             return
 
-        messages: list[dict] = []
-        for ch in self.cat.channels:
-            if not isinstance(ch, discord.TextChannel):
-                continue
-            if ch.name == "mj-prive":
-                continue
-            async for m in ch.history(limit=50, oldest_first=True):
-                if m.author.id == bot.user.id:
-                    continue
-                content     = m.content.strip()
-                attachments = []
-                for a in m.attachments[:5]:
-                    if a.size > 4 * 1024 * 1024:
-                        attachments.append({"filename": a.filename, "data": None, "too_large": True})
-                    else:
-                        try:
-                            raw = await a.read()
-                            attachments.append({
-                                "filename": a.filename,
-                                "data": base64.b64encode(raw).decode("ascii"),
-                            })
-                        except Exception:
-                            attachments.append({"filename": a.filename, "data": None, "too_large": False})
-                embed_parts = []
-                for e in m.embeds:
-                    label = e.title or (e.description[:80] if e.description else "") or "[embed]"
-                    embed_parts.append(f"[Embed : {label}]")
-                if embed_parts:
-                    content = (content + "\n" + " | ".join(embed_parts)).strip()
-                if not content and not attachments:
-                    continue
-                messages.append({
-                    "channel":     ch.name,
-                    "author":      m.author.display_name,
-                    "content":     content[:500],
-                    "ts":          m.created_at.strftime("%d/%m %H:%M"),
-                    "is_bot":      m.author.bot,
-                    "attachments": attachments[:5],
-                })
-
+        messages   = await _collect_channel_messages(self.cat)
         player_ids = list(category_players.get(self.cat.id, set()))
         game       = self.cat.name
 
         await db_template_insert(str(uuid.uuid4()), self.creator.id, name, game, player_ids, messages)
         await interaction.followup.send(
-            f"✅ Template **{name}** sauvegardé avec {len(messages)} message(s).", ephemeral=True
+            f"✅ Sauvegarde **{name}** créée avec {len(messages)} message(s).", ephemeral=True
+        )
+
+
+class OverwriteTemplateSelect(discord.ui.Select):
+    def __init__(self, cat: discord.CategoryChannel, templates: list[dict]):
+        self.cat      = cat
+        self.tmpl_map = {t["id"]: t for t in templates}
+        options = [
+            discord.SelectOption(label=t["name"][:100], value=t["id"])
+            for t in templates[:25]
+        ]
+        super().__init__(placeholder="Choisir la sauvegarde à écraser...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        tmpl = self.tmpl_map[self.values[0]]
+        await interaction.response.defer(ephemeral=True)
+        messages   = await _collect_channel_messages(self.cat)
+        player_ids = list(category_players.get(self.cat.id, set()))
+        game       = self.cat.name
+        await db_template_update(tmpl["id"], game, player_ids, messages)
+        await interaction.followup.send(
+            f"✅ Sauvegarde **{tmpl['name']}** écrasée avec {len(messages)} message(s).", ephemeral=True
+        )
+
+
+class OverwriteSelectView(discord.ui.View):
+    def __init__(self, cat: discord.CategoryChannel, templates: list[dict]):
+        super().__init__(timeout=60)
+        self.add_item(OverwriteTemplateSelect(cat, templates))
+
+
+class DeleteTemplateSelect(discord.ui.Select):
+    def __init__(self, templates: list[dict]):
+        self.tmpl_map = {t["id"]: t for t in templates}
+        options = [
+            discord.SelectOption(
+                label=t["name"][:100],
+                description=f"{t['game']} — {len(t['player_ids'])} joueur(s)"[:100],
+                value=t["id"],
+            )
+            for t in templates[:25]
+        ]
+        super().__init__(placeholder="Choisir la sauvegarde à supprimer...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        tmpl = self.tmpl_map[self.values[0]]
+        await db_template_delete(tmpl["id"])
+        await interaction.response.send_message(
+            f"🗑️ Sauvegarde **{tmpl['name']}** supprimée.", ephemeral=True
+        )
+
+
+class DeleteTemplateSelectView(discord.ui.View):
+    def __init__(self, templates: list[dict]):
+        super().__init__(timeout=60)
+        self.add_item(DeleteTemplateSelect(templates))
+
+
+class SaveOptionsView(discord.ui.View):
+    def __init__(self, cat: discord.CategoryChannel, creator: discord.Member, templates: list[dict]):
+        super().__init__(timeout=60)
+        self.cat       = cat
+        self.creator   = creator
+        self.templates = templates
+
+    @discord.ui.button(label="Nouvelle sauvegarde", style=discord.ButtonStyle.primary, emoji="💾")
+    async def new_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SaveTemplateModal(self.cat, self.creator))
+
+    @discord.ui.button(label="Écraser une existante", style=discord.ButtonStyle.secondary, emoji="♻️")
+    async def overwrite_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = OverwriteSelectView(self.cat, self.templates)
+        await interaction.response.send_message(
+            "Choisir la sauvegarde à écraser :", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="Supprimer une sauvegarde", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = DeleteTemplateSelectView(self.templates)
+        await interaction.response.send_message(
+            "Choisir la sauvegarde à supprimer :", view=view, ephemeral=True
         )
 
 
@@ -928,7 +1028,14 @@ class SessionControlView(discord.ui.View):
 
     @discord.ui.button(label="Sauvegarder", style=discord.ButtonStyle.secondary, emoji="💾")
     async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SaveTemplateModal(self.cat, self.creator))
+        templates = await db_templates_list(self.creator.id)
+        if not templates:
+            await interaction.response.send_modal(SaveTemplateModal(self.cat, self.creator))
+        else:
+            view = SaveOptionsView(self.cat, self.creator, templates)
+            await interaction.response.send_message(
+                "Que veux-tu faire ?", view=view, ephemeral=True
+            )
 
     @discord.ui.button(label="Charger une table", style=discord.ButtonStyle.secondary, emoji="📂")
     async def load_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
