@@ -103,6 +103,7 @@ category_spectators: dict[int, set[int]]       = {}
 category_players:    dict[int, set[int]]       = {}
 category_mj_chan:    dict[int, int]            = {}
 pending_spectators:  dict[tuple[int,int], int] = {}
+voice_join_times:    dict[tuple[int,int], datetime] = {}  # (cat_id, member_id) → heure d'entrée
 
 _state_restored = False
 
@@ -150,6 +151,25 @@ async def init_db():
                 member_id BIGINT NOT NULL,
                 role      TEXT   NOT NULL,
                 PRIMARY KEY (cat_id, member_id, role)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS table_logs (
+                id         SERIAL    PRIMARY KEY,
+                cat_id     BIGINT    NOT NULL,
+                mj_id      BIGINT    NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS play_time (
+                id         SERIAL    PRIMARY KEY,
+                member_id  BIGINT    NOT NULL,
+                cat_id     BIGINT    NOT NULL,
+                is_mj      BOOLEAN   NOT NULL DEFAULT FALSE,
+                joined_at  TIMESTAMP NOT NULL,
+                left_at    TIMESTAMP NOT NULL,
+                duration_s INTEGER   NOT NULL
             )
         """)
         await conn.execute("""
@@ -202,7 +222,8 @@ async def restore_state():
                     d.pop(cid, None)
                 print(f"[DB] Catégorie fantôme {cid} nettoyée")
 
-    # Reconstruit active_members depuis les vocaux Discord
+    # Reconstruit active_members depuis les vocaux Discord + initialise les join times
+    now = utcnow()
     for guild in bot.guilds:
         for cid in list(active_members.keys()):
             cat = guild.get_channel(cid)
@@ -210,6 +231,7 @@ async def restore_state():
                 for vc in voice_channels_of(cat):
                     for m in vc.members:
                         active_members[cid].add(m.id)
+                        voice_join_times[(cid, m.id)] = now
 
     print(f"[DB] État restauré : {len(active_members)} catégorie(s) active(s)")
 
@@ -332,23 +354,29 @@ async def db_stats_fetch() -> dict:
         now         = utcnow()
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-        total      = await conn.fetchval("SELECT COUNT(*) FROM sessions WHERE created = TRUE")
+        total      = await conn.fetchval("SELECT COUNT(*) FROM table_logs")
         this_month = await conn.fetchval(
-            "SELECT COUNT(*) FROM sessions WHERE created = TRUE AND starts_at >= $1", month_start
+            "SELECT COUNT(*) FROM table_logs WHERE created_at >= $1", month_start
         )
-        top_mjs   = await conn.fetch(
-            """SELECT mj_id, COUNT(*) AS cnt FROM sessions WHERE created = TRUE
-               GROUP BY mj_id ORDER BY cnt DESC LIMIT 3"""
+        top_mjs = await conn.fetch(
+            """SELECT member_id, SUM(duration_s) AS total_s
+               FROM play_time
+               WHERE is_mj = TRUE AND joined_at >= $1
+               GROUP BY member_id ORDER BY total_s DESC LIMIT 3""",
+            month_start,
         )
-        top_games = await conn.fetch(
-            """SELECT game, COUNT(*) AS cnt FROM sessions WHERE created = TRUE
-               GROUP BY game ORDER BY cnt DESC LIMIT 3"""
+        top_players = await conn.fetch(
+            """SELECT member_id, SUM(duration_s) AS total_s
+               FROM play_time
+               WHERE is_mj = FALSE AND joined_at >= $1
+               GROUP BY member_id ORDER BY total_s DESC LIMIT 3""",
+            month_start,
         )
     return {
-        "total":      total,
-        "this_month": this_month,
-        "top_mjs":    [(r['mj_id'], r['cnt']) for r in top_mjs],
-        "top_games":  [(r['game'],  r['cnt']) for r in top_games],
+        "total":       total,
+        "this_month":  this_month,
+        "top_mjs":     [(r['member_id'], r['total_s']) for r in top_mjs],
+        "top_players": [(r['member_id'], r['total_s']) for r in top_players],
     }
 
 
@@ -379,6 +407,24 @@ async def db_template_get(creator_id: int, name: str) -> dict | None:
         "player_ids": list(row['player_ids']),
         "messages":   json.loads(row['messages']) if isinstance(row['messages'], str) else row['messages'],
     }
+
+async def db_table_log(cat_id: int, mj_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO table_logs (cat_id, mj_id, created_at) VALUES ($1,$2,$3)",
+            cat_id, mj_id, utcnow(),
+        )
+
+async def db_play_time_insert(member_id: int, cat_id: int, is_mj: bool,
+                               joined_at: datetime, left_at: datetime, duration_s: int):
+    if duration_s < 10:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO play_time (member_id, cat_id, is_mj, joined_at, left_at, duration_s)
+               VALUES ($1,$2,$3,$4,$5,$6)""",
+            member_id, cat_id, is_mj, joined_at, left_at, duration_s,
+        )
 
 async def db_template_update(tmpl_id: str, game: str, player_ids: list[int], messages: list[dict]):
     async with db_pool.acquire() as conn:
@@ -434,6 +480,14 @@ async def grant_access(cat: discord.CategoryChannel, member: discord.Member, spe
 
 async def delete_category(cat: discord.CategoryChannel):
     print(f"[BOT] Suppression de {cat.name}")
+    left_at = utcnow()
+    for vc in voice_channels_of(cat):
+        for m in vc.members:
+            key = (cat.id, m.id)
+            if key in voice_join_times:
+                duration = int((left_at - voice_join_times.pop(key)).total_seconds())
+                is_mj = (m.id == category_creators.get(cat.id))
+                await db_play_time_insert(m.id, cat.id, is_mj, left_at - timedelta(seconds=duration), left_at, duration)
     await delete_spectate_message(cat.guild, cat.id)
     for channel in cat.channels:
         try:
@@ -516,6 +570,7 @@ async def create_session_category(
     )
     for player in (players or []):
         await db_member_add(cat.id, player.id, 'player')
+    await db_table_log(cat.id, mj.id)
 
     return cat, mj_channel, voice_list
 
@@ -585,6 +640,12 @@ async def delete_spectate_message(guild: discord.Guild, cat_id: int):
 #  Stats
 # ─────────────────────────────────────────────────────────
 
+def format_duration(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h{m:02d}" if h else f"{m}min"
+
+
 async def refresh_stats(guild: discord.Guild):
     channel = guild.get_channel(STATS_CHANNEL_ID)
     if not channel:
@@ -596,14 +657,16 @@ async def refresh_stats(guild: discord.Guild):
         return
 
     mj_lines = []
-    for i, (mj_id, cnt) in enumerate(stats["top_mjs"], 1):
-        member = guild.get_member(mj_id)
-        name   = member.display_name if member else f"<@{mj_id}>"
-        mj_lines.append(f"{i}. {name} — {cnt} session{'s' if cnt > 1 else ''}")
+    for i, (mid, total_s) in enumerate(stats["top_mjs"], 1):
+        member = guild.get_member(mid)
+        name   = member.display_name if member else f"<@{mid}>"
+        mj_lines.append(f"{i}. {name} — {format_duration(total_s)}")
 
-    game_lines = []
-    for i, (game, cnt) in enumerate(stats["top_games"], 1):
-        game_lines.append(f"{i}. {game} — {cnt} session{'s' if cnt > 1 else ''}")
+    player_lines = []
+    for i, (mid, total_s) in enumerate(stats["top_players"], 1):
+        member = guild.get_member(mid)
+        name   = member.display_name if member else f"<@{mid}>"
+        player_lines.append(f"{i}. {name} — {format_duration(total_s)}")
 
     embed = discord.Embed(
         title="📊 Statistiques des sessions JDR",
@@ -616,13 +679,13 @@ async def refresh_stats(guild: discord.Guild):
         inline=False,
     )
     embed.add_field(
-        name="🏆 Top 3 MJ",
+        name="🏆 Top MJ — temps de jeu (mois)",
         value="\n".join(mj_lines) or "*Aucune donnée*",
         inline=True,
     )
     embed.add_field(
-        name="🎲 Top 3 jeux",
-        value="\n".join(game_lines) or "*Aucune donnée*",
+        name="🎮 Top joueurs — temps de jeu (mois)",
+        value="\n".join(player_lines) or "*Aucune donnée*",
         inline=True,
     )
     embed.set_footer(text="Mis à jour")
@@ -1267,8 +1330,11 @@ async def on_voice_state_update(member: discord.Member,
             inactive_since.pop(cat.id, None)
             await db_cat_clear_inactive(cat.id)
 
-            is_spectator        = member.id in category_spectators.get(cat.id, set())
             coming_from_outside = (before.channel is None or before.channel.category_id != cat.id)
+            if coming_from_outside:
+                voice_join_times[(cat.id, member.id)] = utcnow()
+
+            is_spectator = member.id in category_spectators.get(cat.id, set())
             if is_spectator and coming_from_outside:
                 try:
                     await member.edit(mute=True)
@@ -1285,6 +1351,16 @@ async def on_voice_state_update(member: discord.Member,
                 return
 
             active_members[cat.id].discard(member.id)
+
+            leaving_category = (after.channel is None or after.channel.category_id != cat.id)
+            if leaving_category:
+                key = (cat.id, member.id)
+                if key in voice_join_times:
+                    left_at  = utcnow()
+                    duration = int((left_at - voice_join_times.pop(key)).total_seconds())
+                    is_mj    = (member.id == category_creators.get(cat.id))
+                    await db_play_time_insert(member.id, cat.id, is_mj,
+                                              left_at - timedelta(seconds=duration), left_at, duration)
 
             is_spectator = member.id in category_spectators.get(cat.id, set())
             if is_spectator and before.mute:
