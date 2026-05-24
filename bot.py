@@ -755,13 +755,20 @@ async def _restore_template(
             color=discord.Color.dark_grey(),
         )
         await ch.send(embed=header)
-        batch = []
+        batch     = []
+        batch_len = 0
         for entry in history:
-            line = f"**[{entry['author']}]** : {entry['content']}"
-            batch.append(line)
-            if len(batch) >= 10:
+            prefix = "🤖" if entry.get("is_bot") else "💬"
+            parts  = [f"{prefix} **[{entry['author']}]** `{entry['ts']}` : {entry['content']}"]
+            for att in entry.get("attachments", []):
+                parts.append(f"📎 [{att['filename']}]({att['url']})")
+            line = "\n".join(parts)
+            if batch_len + len(line) + 1 > 1800:
                 await ch.send("\n".join(batch))
-                batch = []
+                batch     = []
+                batch_len = 0
+            batch.append(line)
+            batch_len += len(line) + 1
         if batch:
             await ch.send("\n".join(batch))
 
@@ -855,15 +862,25 @@ class SaveTemplateModal(discord.ui.Modal, title="Sauvegarder la table"):
             if ch.name == "mj-prive":
                 continue
             async for m in ch.history(limit=50, oldest_first=True):
-                if m.author.bot:
+                if m.author.id == bot.user.id:
                     continue
-                if not m.content.strip():
+                content     = m.content.strip()
+                attachments = [{"url": a.url, "filename": a.filename} for a in m.attachments]
+                embed_parts = []
+                for e in m.embeds:
+                    label = e.title or (e.description[:80] if e.description else "") or "[embed]"
+                    embed_parts.append(f"[Embed : {label}]")
+                if embed_parts:
+                    content = (content + "\n" + " | ".join(embed_parts)).strip()
+                if not content and not attachments:
                     continue
                 messages.append({
-                    "channel": ch.name,
-                    "author":  m.author.display_name,
-                    "content": m.content[:500],
-                    "ts":      m.created_at.strftime("%d/%m %H:%M"),
+                    "channel":     ch.name,
+                    "author":      m.author.display_name,
+                    "content":     content[:500],
+                    "ts":          m.created_at.strftime("%d/%m %H:%M"),
+                    "is_bot":      m.author.bot,
+                    "attachments": attachments[:5],
                 })
 
         player_ids = list(category_players.get(self.cat.id, set()))
