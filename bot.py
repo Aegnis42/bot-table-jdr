@@ -33,6 +33,7 @@ CALENDAR_CHANNEL_ID   = 1493991218470850681
 FORUM_OS_ID           = 1455406081621758027
 FORUM_CAMPAGNE_ID     = 1455406457829851148
 ANNONCE_CHANNEL_ID    = 1491158533058855115
+HIDDEN_ROLE_ID        = 1455430632669712608
 
 TAG_TO_ROLE = {
     "Semaine / Journee":  "Semaine / Journée",
@@ -511,16 +512,22 @@ async def create_session_category(
     mj: discord.Member,
     players: list[discord.Member] | None = None,
 ) -> tuple[discord.CategoryChannel, discord.TextChannel, list[discord.VoiceChannel]]:
-    ref_cat  = guild.get_channel(REFERENCE_CATEGORY_ID)
-    position = ref_cat.position if ref_cat else 0
+    ref_cat     = guild.get_channel(REFERENCE_CATEGORY_ID)
+    position    = ref_cat.position if ref_cat else 0
+    hidden_role = guild.get_role(HIDDEN_ROLE_ID)
+    deny_view   = discord.PermissionOverwrite(view_channel=False)
+
+    cat_overwrites = {
+        guild.default_role: deny_view,
+        mj:                 discord.PermissionOverwrite(view_channel=True, speak=True, stream=True),
+    }
+    if hidden_role:
+        cat_overwrites[hidden_role] = deny_view
 
     cat = await guild.create_category(
         f"Session de {mj.display_name}",
         position=position,
-        overwrites={
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            mj:                 discord.PermissionOverwrite(view_channel=True, speak=True, stream=True),
-        },
+        overwrites=cat_overwrites,
     )
     active_members[cat.id]      = set()
     category_creators[cat.id]   = mj.id
@@ -545,14 +552,14 @@ async def create_session_category(
         view_channel=True, connect=True, speak=True,
         stream=True, mute_members=True, deafen_members=True,
     )
+    vc_overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+        mj: creator_vc_ow,
+    }
+    if hidden_role:
+        vc_overwrites[hidden_role] = deny_view
     voice_list = [
-        await guild.create_voice_channel(
-            name, category=cat,
-            overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-                mj: creator_vc_ow,
-            },
-        )
+        await guild.create_voice_channel(name, category=cat, overwrites=vc_overwrites)
         for name in VOICE_CHANNELS
     ]
 
