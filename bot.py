@@ -10,6 +10,8 @@ import asyncpg
 import asyncio
 import time
 import json
+import base64
+import io
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
@@ -755,22 +757,24 @@ async def _restore_template(
             color=discord.Color.dark_grey(),
         )
         await ch.send(embed=header)
-        batch     = []
-        batch_len = 0
         for entry in history:
             prefix = "🤖" if entry.get("is_bot") else "💬"
-            parts  = [f"{prefix} **[{entry['author']}]** `{entry['ts']}` : {entry['content']}"]
+            text   = f"{prefix} **[{entry['author']}]** `{entry['ts']}`"
+            if entry["content"]:
+                text += f" : {entry['content']}"
+
+            files = []
             for att in entry.get("attachments", []):
-                parts.append(f"📎 [{att['filename']}]({att['url']})")
-            line = "\n".join(parts)
-            if batch_len + len(line) + 1 > 1800:
-                await ch.send("\n".join(batch))
-                batch     = []
-                batch_len = 0
-            batch.append(line)
-            batch_len += len(line) + 1
-        if batch:
-            await ch.send("\n".join(batch))
+                if att.get("data"):
+                    raw = base64.b64decode(att["data"])
+                    files.append(discord.File(io.BytesIO(raw), filename=att["filename"]))
+                elif att.get("too_large"):
+                    text += f"\n📎 ~~{att['filename']}~~ *(trop grand, non sauvegardé)*"
+
+            try:
+                await ch.send(content=text[:2000], files=files or discord.utils.MISSING)
+            except discord.HTTPException:
+                await ch.send(content=text[:2000])
 
     await update_spectate_message(guild, cat)
     await interaction.followup.send(f"✅ Table **{tmpl['name']}** restaurée.", ephemeral=True)
@@ -865,7 +869,19 @@ class SaveTemplateModal(discord.ui.Modal, title="Sauvegarder la table"):
                 if m.author.id == bot.user.id:
                     continue
                 content     = m.content.strip()
-                attachments = [{"url": a.url, "filename": a.filename} for a in m.attachments]
+                attachments = []
+                for a in m.attachments[:5]:
+                    if a.size > 4 * 1024 * 1024:
+                        attachments.append({"filename": a.filename, "data": None, "too_large": True})
+                    else:
+                        try:
+                            raw = await a.read()
+                            attachments.append({
+                                "filename": a.filename,
+                                "data": base64.b64encode(raw).decode("ascii"),
+                            })
+                        except Exception:
+                            attachments.append({"filename": a.filename, "data": None, "too_large": False})
                 embed_parts = []
                 for e in m.embeds:
                     label = e.title or (e.description[:80] if e.description else "") or "[embed]"
